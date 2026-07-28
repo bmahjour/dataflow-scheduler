@@ -18,6 +18,8 @@
 
 #include "dataflow-scheduler/Transforms/PathExpansion/Planner.h"
 
+#include <llvm/Support/ErrorHandling.h>
+
 #include "Ktdp/KtdpAttrs.hpp"
 #include "dataflow-scheduler/Analysis/ArchViews/RoutingGraph.h"
 #include "dataflow-scheduler/Analysis/PipelineTree.h"
@@ -50,6 +52,8 @@ static mlir::AffineMap createAffineMapForIntermediateBuffer(
 }
 
 /// Helper to validate FIFO slot index assignment
+/// Checks that the assigned slot index matches the original result index
+/// from the template transfer operation
 void validateFifoSlotIndex(mlir::Value orig_fifo_value,
                            size_t assigned_slot_idx,
                            const PrivateResourceSpec* fifo_spec) {
@@ -246,6 +250,7 @@ void StageMaterializationInfo::dump() const {
 //===----------------------------------------------------------------------===//
 mlir::LogicalResult validateLinearChain(
     llvm::ArrayRef<StageNode*> sorted_stages) {
+  // Empty is trivially linear
   if (sorted_stages.empty()) return mlir::success();
 
   // Walk in topological order (sources first).
@@ -407,7 +412,7 @@ static void assignOriginalStageResources(
 
     auto stage_op =
         mlir::dyn_cast_or_null<mlir::ktdf::StageOp>(stage->getOperation());
-    if (!stage_op) continue;
+    assert(stage_op && "expected operation to be valid for original stages");
 
     // Rule 1: anchor stage — applicable_unit already known from input IR.
     if (auto units = stage_op.getApplicableUnits()) {
@@ -463,7 +468,7 @@ static void assignOriginalStageResources(
 
       auto stage_op =
           mlir::dyn_cast_or_null<mlir::ktdf::StageOp>(stage->getOperation());
-      if (!stage_op) continue;
+      assert(stage_op && "expected operation to be valid for original stages");
 
       auto [src_ms, dst_ms] = firstTransferMemSpaces(stage_op);
 
@@ -622,6 +627,7 @@ static llvm::FailureOr<llvm::SmallVector<StageNode*>> buildExpandedStageList(
       return idx + 2;
     }
 
+    llvm_unreachable("unhandled scenario");
     return idx + 1;
   };
 
@@ -852,7 +858,8 @@ static mlir::LogicalResult classifyOriginalStages(
              "Expected valid FIFO endpoint attributes");
 
       mlir::Type element_type = fifo_slot_type.getElementType();
-      assert(!fifo_slot_type.isDynamicNumElements());
+      assert(!fifo_slot_type.isDynamicNumElements() &&
+             "Dynamic FIFO sizes not supported in path expansion");
       int64_t num_elements = fifo_slot_type.getStaticNumElements();
 
       FifoKey fifo_key = {fifo_src, fifo_dest};
@@ -886,13 +893,10 @@ static mlir::LogicalResult classifyOriginalStages(
       stage_info.transfers.push_back(transfer_info);
       stage_info.kind = StageMaterializationInfo::Kind::kAdaptFifoKinds;
 
-      LLVM_DEBUG({
-        llvm::dbgs() << "  Stage " << current_stage->getStageId() << ": "
-                     << (is_read ? "read_from_fifo" : "write_to_fifo")
-                     << " - FIFO src=" << fifo_src << ", dest=" << fifo_dest
-                     << ", slot " << slot_idx << ", elements=" << num_elements
-                     << "\n";
-      });
+      LDBG(1) << "  Stage " << current_stage->getStageId() << ": "
+              << (is_read ? "read_from_fifo" : "write_to_fifo")
+              << " - FIFO src=" << fifo_src << ", dest=" << fifo_dest
+              << ", slot " << slot_idx << ", elements=" << num_elements << "\n";
 
       return mlir::WalkResult::advance();
     });
@@ -933,9 +937,8 @@ static mlir::LogicalResult populateIntermediateStageTransfers(
 
     ResourceType intermediate_resource = stage_info.stage_resource;
 
-    LLVM_DEBUG(llvm::dbgs() << "  Processing intermediate stage "
-                            << current_stage->getStageId() << " (resource: "
-                            << intermediate_resource << ")\n");
+    LDBG(1) << "  Processing intermediate stage " << current_stage->getStageId()
+            << " (resource: " << intermediate_resource << ")\n";
 
     stage_info.kind = StageMaterializationInfo::Kind::kSyntheticTransfer;
 
@@ -966,6 +969,8 @@ static mlir::LogicalResult populateIntermediateStageTransfers(
       const PrivateResourceSpec* source_resource_spec =
           prev_transfer->dest_private_resource;
 
+      // Look for matching transfer in next stage to get destination resource
+      // Find a transfer in next_stage that has intermediate_resource as source
       const PrivateResourceSpec* dest_resource_spec = nullptr;
       size_t dest_slot_idx = 0;
       llvm::SmallVector<mlir::Value> dest_indices_from_next;
@@ -1025,9 +1030,8 @@ static mlir::LogicalResult populateIntermediateStageTransfers(
 
       stage_info.transfers.push_back(transfer_info);
 
-      LLVM_DEBUG(llvm::dbgs()
-                 << "    Created transfer: " << inferred_source_resource
-                 << " -> " << inferred_dest_resource << "\n");
+      LDBG(1) << "    Created transfer: " << inferred_source_resource << " -> "
+              << inferred_dest_resource << "\n";
     }
   }
 
@@ -1107,7 +1111,7 @@ static mlir::LogicalResult applyPathExpansion(
     const scheduler::arch_view::RoutingGraph& arch_graph,
     PathExpansionPlan* plan, int& next_stage_id) {
   // STEP 1: Build expanded stage list
-  LLVM_DEBUG(llvm::dbgs() << "\n=== Step 1: Build Expanded Stage List ===\n");
+  LDBG(1) << "\n=== Step 1: Build Expanded Stage List ===\n";
   auto expanded_stages_or =
       buildExpandedStageList(tree, pipeline, full_path, sorted_stages,
                              arch_graph, plan, next_stage_id);
@@ -1115,26 +1119,28 @@ static mlir::LogicalResult applyPathExpansion(
     return mlir::failure();
   }
   llvm::SmallVector<StageNode*> expanded_stages = *expanded_stages_or;
-  LLVM_DEBUG(
-      debugPrintStageList(llvm::dbgs(), expanded_stages, plan, "After Step 1"));
+  LDBG_OS(1, [&](llvm::raw_ostream& os) {
+    debugPrintStageList(os, expanded_stages, plan, "After Step 1");
+  });
 
   // STEP 2: Classify original stages and create private resources
-  LLVM_DEBUG(llvm::dbgs() << "\n=== Step 2: Classify Original Stages ===\n");
+  LDBG(1) << "\n=== Step 2: Classify Original Stages ===\n";
   if (mlir::failed(classifyOriginalStages(expanded_stages, arch_graph, plan))) {
     return mlir::failure();
   }
-  LLVM_DEBUG(
-      debugPrintStageList(llvm::dbgs(), expanded_stages, plan, "After Step 2"));
+  LDBG_OS(1, [&](llvm::raw_ostream& os) {
+    debugPrintStageList(os, expanded_stages, plan, "After Step 2");
+  });
 
   // STEP 3: Populate synthetic stage transfers
-  LLVM_DEBUG(
-      llvm::dbgs() << "\n=== Step 3: Populate Synthetic Stage Transfers ===\n");
+  LDBG(1) << "\n=== Step 3: Populate Synthetic Stage Transfers ===\n";
   if (mlir::failed(populateIntermediateStageTransfers(expanded_stages,
                                                       arch_graph, plan))) {
     return mlir::failure();
   }
-  LLVM_DEBUG(
-      debugPrintStageList(llvm::dbgs(), expanded_stages, plan, "After Step 3"));
+  LDBG_OS(1, [&](llvm::raw_ostream& os) {
+    debugPrintStageList(os, expanded_stages, plan, "After Step 3");
+  });
   LLVM_DEBUG(debugPrintPlanningSummary(expanded_stages, plan));
 
   return mlir::success();
@@ -1169,7 +1175,7 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
   std::optional<scheduler::arch_view::RoutingGraph::Path> full_path_opt =
       buildFullShortestPath(endpoint_path, arch_graph);
   if (!full_path_opt) {
-    LLVM_DEBUG(llvm::dbgs() << "No path found for full resource path\n");
+    LDBG(1) << "No path found for full resource path\n";
     return nullptr;
   }
   scheduler::arch_view::RoutingGraph::Path full_path = *full_path_opt;
