@@ -1152,6 +1152,7 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
   auto plan = std::make_unique<PathExpansionPlan>();
   plan->changed = false;
 
+  // PREP 1: Sort and validate pipeline stages
   llvm::FailureOr<llvm::SmallVector<StageNode*>> sorted_stages_or =
       sortAndValidateLinearPipelineStages(tree, pipeline);
   if (mlir::failed(sorted_stages_or)) {
@@ -1159,29 +1160,34 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
   }
   llvm::SmallVector<StageNode*> sorted_stages = *sorted_stages_or;
 
+  // PREP 2: Verify pipeline has an anchor stage
   if (!hasAnchorStage(sorted_stages)) {
     return nullptr;
   }
 
   LLVM_DEBUG(debugPrintInitialPlannerState(pipeline, sorted_stages));
 
+  // PREP 3: Assign resources and collect endpoint path
   assignOriginalStageResources(sorted_stages, plan.get());
   llvm::SmallVector<ResourceType> endpoint_path =
       collectOriginalStageResourcePath(sorted_stages, plan.get());
   if (endpoint_path.size() < 2) {
+    // Need at least source and destination
     return nullptr;
   }
 
+  // PREP 4: Build full shortest path across architecture graph
   std::optional<scheduler::arch_view::RoutingGraph::Path> full_path_opt =
       buildFullShortestPath(endpoint_path, arch_graph);
   if (!full_path_opt) {
-    LDBG(1) << "No path found for full resource path\n";
+    LDBG(1) << "No resource path found\n";
     return nullptr;
   }
   scheduler::arch_view::RoutingGraph::Path full_path = *full_path_opt;
 
   LLVM_DEBUG(debugPrintFullPath(full_path));
 
+  // PREP 5: Check whether path expansion is needed
   if (!needsExpansion(endpoint_path, full_path, arch_graph)) {
     plan->changed = false;
     LDBG(1) << "Pipeline already legal";
