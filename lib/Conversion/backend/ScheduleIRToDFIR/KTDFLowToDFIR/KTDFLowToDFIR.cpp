@@ -60,10 +60,6 @@ namespace scheduler {
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h.inc"
 }  // namespace scheduler
 
-static llvm::cl::opt<bool> DisableThisPass(
-    "disable-" PASS_NAME, llvm::cl::desc("Disable KTDFLowering To DFIR pass"),
-    llvm::cl::init(false));
-
 namespace {
 
 // Run the full canonicalization pattern set (all loaded dialects + registered
@@ -89,7 +85,6 @@ struct KTDFLowToDFIRPass
       : scheduler_ctx_(scheduler_ctx) {}
 
   void runOnOperation() override {
-    if (DisableThisPass) return;
     LDBG(1) << "========= " PASS_NAME " =========";
     mlir::ModuleOp module_op = getOperation();
 
