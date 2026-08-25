@@ -43,14 +43,16 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     KTDPLowering_Op<"construct_indirect_access_tile",
                     [AttrSizedOperandSegments]> {
 
-  let summary = "ind_addr_buf-legalized indirect access tile";
+  let summary = "indirect access tile with indirection factored into an IAB "
+                "base address and direct element offsets";
   let description = [{
     The `ktdp_lowering.construct_indirect_access_tile` operation is the
-    ind_addr_buf-legalized form of `ktdp.construct_indirect_access_tile`.
-    Indirection has already been resolved by filling the indirect address
-    buffer (IAB): the entry selected by `$ind_addr_buf_subscripts` into
-    `$ind_addr_buf_memref` supplies an element-offset delta that is added to
-    the flat address computed from `$base` and `$direct_subscripts`.
+    lowered form of `ktdp.construct_indirect_access_tile` in which the
+    indirect address has been factored: the base address contribution is
+    supplied by an entry in the indirect address buffer (IAB), selected by
+    `$ind_addr_buf_subscripts` into `$ind_addr_buf_memref`, and the remaining
+    dimensions are expressed as direct element offsets into `$base` via
+    `$direct_subscripts`.
 
     **Semantics of `base_ptr = %iab_mv[%s0, %s1, ...]`:**  the `index` value
     stored at those subscripts in the IAB memref is added as an element-offset
