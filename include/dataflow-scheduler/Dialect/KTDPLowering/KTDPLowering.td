@@ -26,6 +26,7 @@
 
 include "mlir/IR/OpBase.td"
 include "mlir/IR/BuiltinAttributes.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLoweringDialect.td"
 
@@ -41,7 +42,8 @@ class KTDPLowering_Op<string mnemonic, list<Trait> traits = []> :
 
 def KTDPLowering_ConstructIndirectAccessTileOp :
     KTDPLowering_Op<"construct_indirect_access_tile",
-                    [AttrSizedOperandSegments]> {
+                    [AttrSizedOperandSegments,
+                     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
 
   let summary = "indirect access tile with indirection factored into an IAB "
                 "base address and direct element offsets";

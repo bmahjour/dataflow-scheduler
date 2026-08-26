@@ -27,6 +27,7 @@
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/OpDefinition.h>
 #include <mlir/IR/OpImplementation.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLoweringDialect.h"  // IWYU pragma: keep
 #include "ktir/Dialect/KTDP/KTDPTypes.h"
