@@ -22,7 +22,7 @@
 // CHECK: ktdp_lowering.construct_indirect_access_tile
 // CHECK-SAME: intermediate_variables([[S0]], [[S1]], [[D0]], [[D1]])
 // CHECK-SAME: base_ptr = [[IAB]]{{\[}}[[S0]], [[S1]]{{\]}}
-// CHECK-SAME: [[BASE]]{{\[}}([[C0]]), ([[D0]]), ([[D1]]){{\]}}
+// CHECK-SAME: [[BASE]]{{\[}}[[C0]], [[D0]], [[D1]]{{\]}}
 // CHECK-SAME: variables_space_order = #[[MAP]]
 // CHECK-SAME: variables_space_set = #[[SET1]]
 // CHECK-SAME: : memref<64x2x64xf16>, memref<2x32xindex, "IAB">
@@ -38,7 +38,7 @@ func.func @roundtrip_2d_iab(
   %tile = ktdp_lowering.construct_indirect_access_tile
       intermediate_variables(%arg5, %arg6, %arg7, %arg8)
       base_ptr = %iab[%arg5, %arg6]
-      %base[(%c0), (%arg7), (%arg8)]
+      %base[%c0, %arg7, %arg8]
       {variables_space_set = #set1, variables_space_order = #map}
       : memref<64x2x64xf16>, memref<2x32xindex, "IAB">
       -> !ktdp.access_tile<2x32x2x64xindex>
@@ -55,7 +55,7 @@ func.func @roundtrip_2d_iab(
 // CHECK: ktdp_lowering.construct_indirect_access_tile
 // CHECK-SAME: intermediate_variables([[S0]], [[D0]], [[D1]])
 // CHECK-SAME: base_ptr = [[IAB]]{{\[}}[[S0]]{{\]}}
-// CHECK-SAME: [[BASE]]{{\[}}([[C0]]), ([[D0]]), ([[D1]]){{\]}}
+// CHECK-SAME: [[BASE]]{{\[}}[[C0]], [[D0]], [[D1]]{{\]}}
 // CHECK-SAME: variables_space_order = #[[MAP]]
 // CHECK-SAME: variables_space_set = #[[SET2]]
 // CHECK-SAME: : memref<64x2x64xf16>, memref<32xindex, "IAB">
@@ -70,7 +70,7 @@ func.func @roundtrip_1d_iab(
   %tile = ktdp_lowering.construct_indirect_access_tile
       intermediate_variables(%arg6, %arg7, %arg8)
       base_ptr = %iab[%arg6]
-      %base[(%c0), (%arg7), (%arg8)]
+      %base[%c0, %arg7, %arg8]
       {variables_space_set = #set2, variables_space_order = #map}
       : memref<64x2x64xf16>, memref<32xindex, "IAB">
       -> !ktdp.access_tile<32x2x64xindex>
@@ -88,7 +88,7 @@ func.func @roundtrip_1d_iab(
 // CHECK: ktdp_lowering.construct_indirect_access_tile
 // CHECK-SAME: intermediate_variables([[S0]], [[D0]], [[D1]])
 // CHECK-SAME: base_ptr = [[IAB]]{{\[}}[[I1]], [[S0]]{{\]}}
-// CHECK-SAME: [[BASE]]{{\[}}([[C0]]), ([[D0]]), ([[D1]]){{\]}}
+// CHECK-SAME: [[BASE]]{{\[}}[[C0]], [[D0]], [[D1]]{{\]}}
 // CHECK-SAME: variables_space_order = #[[MAP]]
 // CHECK-SAME: variables_space_set = #[[SET2]]
 // CHECK-SAME: : memref<64x2x64xf16>, memref<2x32xindex, "IAB">
@@ -104,7 +104,7 @@ func.func @mixed_iab_subscripts(
   %tile = ktdp_lowering.construct_indirect_access_tile
       intermediate_variables(%arg6, %arg7, %arg8)
       base_ptr = %iab[%i1, %arg6]
-      %base[(%c0), (%arg7), (%arg8)]
+      %base[%c0, %arg7, %arg8]
       {variables_space_set = #set2, variables_space_order = #map}
       : memref<64x2x64xf16>, memref<2x32xindex, "IAB">
       -> !ktdp.access_tile<32x2x64xindex>

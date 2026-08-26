@@ -82,7 +82,7 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     %tile = ktdp_lowering.construct_indirect_access_tile
         intermediate_variables(%arg6, %arg7, %arg8)
         base_ptr = %iab_mv[%arg6]
-        %X[(%c0), (%c0 + %arg7), (%arg8)]
+        %X[%c0, %arg7, %arg8]
         {variables_space_set = #set, variables_space_order = #map}
         : memref<64x2x64xf16>, memref<32xindex, "IAB"> -> !ktdp.access_tile<32x2x64xindex>
     ```
@@ -93,7 +93,7 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     %tile = ktdp_lowering.construct_indirect_access_tile
         intermediate_variables(%arg5, %arg6, %arg7, %arg8)
         base_ptr = %iab_mv[%arg5, %arg6]
-        %X[(%c0), (%c0 + %arg7), (%arg8)]
+        %X[%c0, %arg7, %arg8]
         {variables_space_set = #set2, variables_space_order = #map}
         : memref<64x2x64xf16>, memref<2x32xindex, "IAB"> -> !ktdp.access_tile<2x32x2x64xindex>
     ```
@@ -122,7 +122,12 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
   let results = (outs Ktdp_AccessTileType:$result);
 
   let hasVerifier = 1;
-  let hasCustomAssemblyFormat = 1;
+  let assemblyFormat = [{
+    `intermediate_variables` `(` $intermediate_variables `)`
+    `base_ptr` `=` $ind_addr_buf_memref `[` $ind_addr_buf_subscripts `]`
+    $base `[` $direct_subscripts `]`
+    attr-dict `:` type($base) `,` type($ind_addr_buf_memref) `->` qualified(type($result))
+  }];
 }
 
 #endif // DATAFLOW_SCHEDULER_DIALECT_KTDPLOWERING_KTDPLOWERING_TD
