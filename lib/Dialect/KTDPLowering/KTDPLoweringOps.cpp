@@ -43,22 +43,6 @@ void KTDPLoweringDialect::registerOps() {
 }
 
 //===----------------------------------------------------------------------===//
-// ConstructIndirectAccessTileOp — memory effects
-//
-// Reports a Read on $ind_addr_buf_memref: the op loads an index value from
-// the IAB at construction time, so analyses (alias, CSE, motion) must treat
-// it as a memref reader.
-//===----------------------------------------------------------------------===//
-
-void ConstructIndirectAccessTileOp::getEffects(
-    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>&
-        effects) {
-  effects.emplace_back(MemoryEffects::Read::get(),
-                       &getIndAddrBufMemrefMutable(),
-                       SideEffects::DefaultResource::get());
-}
-
-//===----------------------------------------------------------------------===//
 // Tablegen Definitions
 //===----------------------------------------------------------------------===//
 
