@@ -27,6 +27,7 @@
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/DialectImplementation.h>
 #include <mlir/IR/OpImplementation.h>
+#include <mlir/Interfaces/ViewLikeInterface.h>
 
 using namespace mlir;
 using namespace mlir::ktdp_lowering;
@@ -62,5 +63,33 @@ LogicalResult ConstructIndirectAccessTileOp::verify() {
                          << " operand(s) but ind_addr_buf_memref has rank "
                          << iab_type.getRank() << "; they must be equal";
 
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ConstructMemoryViewOp — verifier
+//===----------------------------------------------------------------------===//
+
+LogicalResult ConstructMemoryViewOp::verify() {
+  unsigned nDims = getStaticSizes().size();
+  if (getStaticStrides().size() != nDims)
+    return emitOpError(
+        "static_sizes and static_strides must have equal length");
+  unsigned dynSizes = llvm::count(getStaticSizes(), mlir::ShapedType::kDynamic);
+  unsigned dynStrides =
+      llvm::count(getStaticStrides(), mlir::ShapedType::kDynamic);
+  if (getSizes().size() != dynSizes)
+    return emitOpError(
+        "number of dynamic size operands does not match "
+        "kDynamic entries in static_sizes");
+  if (getStrides().size() != dynStrides)
+    return emitOpError(
+        "number of dynamic stride operands does not match "
+        "kDynamic entries in static_strides");
+  auto memrefType = mlir::dyn_cast<mlir::MemRefType>(getResult().getType());
+  if (!memrefType) return emitOpError("result must be a memref type");
+  if (memrefType.getRank() != static_cast<int64_t>(nDims))
+    return emitOpError(
+        "result memref rank does not match sizes/strides length");
   return success();
 }

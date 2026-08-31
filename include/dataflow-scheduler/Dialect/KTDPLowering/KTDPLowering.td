@@ -27,6 +27,7 @@
 include "mlir/IR/OpBase.td"
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/ViewLikeInterface.td"
 
 include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLoweringDialect.td"
 
@@ -129,6 +130,66 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     $base `[` $direct_subscripts `]`
     attr-dict `:` type($base) `,` type($ind_addr_buf_memref) `->` qualified(type($result))
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// ConstructMemoryViewOp
+//===----------------------------------------------------------------------===//
+
+def KTDPLowering_ConstructMemoryViewOp :
+    KTDPLowering_Op<"construct_memory_view", [
+      AttrSizedOperandSegments,
+      MemRefsNormalizable,
+      Pure
+    ]> {
+
+  let summary = "Lowering-phase variant of ktdp.construct_memory_view that "
+                "accepts any memory-space attribute";
+  let description = [{
+    The `ktdp_lowering.construct_memory_view` operation is the lowering-phase
+    counterpart of `ktdp.construct_memory_view`.  It has identical semantics and
+    assembly syntax but relaxes the `memory_space` attribute constraint: whereas
+    `ktdp.construct_memory_view` requires a `#ktdp.memory_space<...>` typed
+    attribute, this variant accepts any attribute (e.g. a plain `StringAttr`
+    such as `"IAB"`, or other architecture-defined memory spaces that
+    are not expressible as a data-parallel `MemorySpaceAttr`).
+
+    This op is introduced by the `IndirectComputeGroupSplit` pass wherever an
+    ind_addr_buf memory view is constructed and is carried forward unchanged
+    through subsequent lowering steps.  All other fields — `offset`, `sizes`,
+    `strides`, `static_sizes`, `static_strides`, `coordinate_set`, and the
+    result memref type — are identical to those of `ktdp.construct_memory_view`.
+
+    Example:
+    ```mlir
+    #set = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+    %iab_mv = ktdp_lowering.construct_memory_view %c0,
+        sizes: [32], strides: [1]
+        {coordinate_set = #set, memory_space = "IAB"}
+        : memref<32xindex, "IAB">
+    ```
+  }];
+
+  let arguments = (ins
+    Index:$offset,
+    Variadic<Index>:$sizes,
+    Variadic<Index>:$strides,
+    DenseI64ArrayAttr:$static_sizes,
+    DenseI64ArrayAttr:$static_strides,
+    AnyAttr:$memory_space,
+    Builtin_IntegerSetAttr:$coordinate_set
+  );
+  let results = (outs AnyMemRef:$result);
+
+  let assemblyFormat = [{
+    $offset `` `,`  `sizes` `` `:`
+    custom<DynamicIndexList>($sizes, $static_sizes)
+    `` `,` `strides` `` `:`
+    custom<DynamicIndexList>($strides, $static_strides)
+    attr-dict `:` type($result)
+  }];
+
+  let hasVerifier = 1;
 }
 
 #endif // DATAFLOW_SCHEDULER_DIALECT_KTDPLOWERING_KTDPLOWERING_TD
