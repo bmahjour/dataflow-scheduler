@@ -306,8 +306,28 @@ static ResourceType memrefMemorySpace(mlir::Value val) {
 /// Return the {source, dest} memref memory-spaces from the first
 /// data_transfer op in stage_op.  Either element may be nullptr if that side
 /// is not a memref (e.g. a FIFO).  Both are found in a single walk.
+///
+/// For stages containing an IndDataTransferOp, that op takes priority:
+/// - Gather (ind_src present): returns (dir_src memory-space, nullptr).
+/// - Scatter (ind_dst present): returns (nullptr, dir_dst memory-space).
+/// This ensures the IAB-fill DataTransferOp does not
+/// pollute the result with its "IAB" destination memory-space.
 static std::pair<ResourceType, ResourceType> firstTransferMemSpaces(
     mlir::ktdf::StageOp stage_op) {
+  // Check for IndDataTransferOp first — it takes priority over any co-located
+  // DataTransferOp (e.g. the IBR fill inside scf.if in scatter stages).
+  mlir::ktdf::IndDataTransferOp ind_transfer;
+  stage_op.walk([&](mlir::ktdf::IndDataTransferOp op) {
+    ind_transfer = op;
+    return mlir::WalkResult::interrupt();
+  });
+  if (ind_transfer) {
+    if (ind_transfer.isGather())
+      return {memrefMemorySpace(ind_transfer.getDirSrc()), nullptr};
+    // scatter
+    return {nullptr, memrefMemorySpace(ind_transfer.getDirDst())};
+  }
+
   ResourceType src, dst;
   stage_op.walk([&](mlir::ktdf::DataTransferOp transfer_op) {
     if (!src) src = memrefMemorySpace(transfer_op.getSource());
@@ -749,30 +769,19 @@ static mlir::LogicalResult classifyOriginalStages(
     auto stage_op =
         mlir::cast<mlir::ktdf::StageOp>(current_stage->getOperation());
 
-    // --- Transfer stage (kAdaptTransfer): memref ↔ intermediate buffer ---
-    stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
-      mlir::Type src_type = transfer.getSource().getType();
-      mlir::Type dest_type = transfer.getDestination().getType();
-
-      bool src_is_memref = mlir::isa<mlir::MemRefType>(src_type);
-      bool dest_is_memref = mlir::isa<mlir::MemRefType>(dest_type);
-
-      // Transfer involves an intermediate buffer if exactly one side is memref
-      if (src_is_memref == dest_is_memref) return mlir::WalkResult::advance();
-
-      bool intermediate_is_source = prev_is_intermediate;
+    // --- Transfer stage (kAdaptTransfer): memref/FIFO ↔ intermediate buffer
+    // --- Shared helper: given a template op, its buffer-side element type and
+    // tile sizes, and which neighbor is intermediate, create the buffer spec,
+    // build the edge, and register the TransferMaterializationInfo.
+    auto classifyTransferStage = [&](mlir::Operation* template_op,
+                                     mlir::Type element_type,
+                                     llvm::ArrayRef<mlir::OpFoldResult>
+                                         tile_sizes,
+                                     bool intermediate_is_source) {
       StageMaterializationInfo& neighbor_info =
           plan->stage_info[intermediate_is_source ? prev_stage : next_stage];
       ResourceType intermediate_resource = neighbor_info.stage_resource;
 
-      // Buffer shape from the memref tile sizes
-      mlir::MemRefType memref_type =
-          src_is_memref ? mlir::cast<mlir::MemRefType>(src_type)
-                        : mlir::cast<mlir::MemRefType>(dest_type);
-
-      llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
-          src_is_memref ? transfer.getMixedSourceSizes()
-                        : transfer.getMixedDestSizes();
       llvm::SmallVector<int64_t> buffer_shape;
       for (mlir::OpFoldResult ofr : tile_sizes) {
         auto int_attr =
@@ -783,9 +792,8 @@ static mlir::LogicalResult classifyOriginalStages(
       }
 
       PrivateResourceSpec* buffer_spec =
-          plan->resource_factory.createMemoryBuffer(
-              intermediate_resource, buffer_shape,
-              memref_type.getElementType());
+          plan->resource_factory.createMemoryBuffer(intermediate_resource,
+                                                    buffer_shape, element_type);
 
       // Use a dummy edge when no direct edge exists between resources
       // (e.g. when an LS node sits between them in the routing graph).
@@ -800,19 +808,58 @@ static mlir::LogicalResult classifyOriginalStages(
       auto edge_opt = arch_graph.getEdgeInfo(src_node_id, dst_node_id);
       scheduler::arch_view::RoutingGraph::EdgeInfo edge{src_node_id,
                                                         dst_node_id, 1};
-      if (edge_opt) {
-        edge = *edge_opt;
-      }
+      if (edge_opt) edge = *edge_opt;
 
-      mlir::OpBuilder builder(transfer->getContext());
+      mlir::OpBuilder builder(template_op->getContext());
       TransferMaterializationInfo* transfer_info =
           plan->transfer_factory.createFromTemplateWithBuffer(
-              transfer, edge, intermediate_resource, stage_info.stage_resource,
-              intermediate_is_source, buffer_spec, builder);
+              template_op, edge, intermediate_resource,
+              stage_info.stage_resource, intermediate_is_source, buffer_spec,
+              builder);
 
       stage_info.transfers.push_back(transfer_info);
       stage_info.kind = StageMaterializationInfo::Kind::kAdaptTransfer;
+    };
 
+    // Direct transfer: exactly one side is a memref (the other is a FIFO).
+    // The IBR-fill DataTransferOp (both sides memref) is skipped by the guard.
+    stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
+      mlir::Type src_type = transfer.getSource().getType();
+      mlir::Type dest_type = transfer.getDestination().getType();
+
+      bool src_is_memref = mlir::isa<mlir::MemRefType>(src_type);
+      bool dest_is_memref = mlir::isa<mlir::MemRefType>(dest_type);
+
+      if (src_is_memref == dest_is_memref) return mlir::WalkResult::advance();
+
+      mlir::MemRefType memref_type =
+          src_is_memref ? mlir::cast<mlir::MemRefType>(src_type)
+                        : mlir::cast<mlir::MemRefType>(dest_type);
+      llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
+          src_is_memref ? transfer.getMixedSourceSizes()
+                        : transfer.getMixedDestSizes();
+
+      classifyTransferStage(transfer.getOperation(),
+                            memref_type.getElementType(), tile_sizes,
+                            /*intermediate_is_source=*/prev_is_intermediate);
+      return mlir::WalkResult::advance();
+    });
+
+    // Indirect transfer: dir_dst (gather) or dir_src (scatter) is the FIFO
+    // slot that gets replaced by the L1 staging buffer.
+    stage_op.walk([&](mlir::ktdf::IndDataTransferOp ind_transfer) {
+      bool is_gather = ind_transfer.isGather();
+      mlir::Value fifo_side =
+          is_gather ? ind_transfer.getDirDst() : ind_transfer.getDirSrc();
+      auto fifo_slot_type =
+          mlir::cast<mlir::ktdf::FifoSlotType>(fifo_side.getType());
+      llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
+          is_gather ? ind_transfer.getMixedDirDstSizes()
+                    : ind_transfer.getMixedDirSrcSizes();
+
+      classifyTransferStage(ind_transfer.getOperation(),
+                            fifo_slot_type.getElementType(), tile_sizes,
+                            /*intermediate_is_source=*/prev_is_intermediate);
       return mlir::WalkResult::advance();
     });
 

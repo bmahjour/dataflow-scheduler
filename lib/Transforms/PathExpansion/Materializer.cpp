@@ -602,6 +602,81 @@ bool PathExpansionMaterializer::tryAdaptDataTransferOp(
   return true;
 }
 
+bool PathExpansionMaterializer::tryAdaptIndDataTransferOp(
+    mlir::ktdf::IndDataTransferOp ind_transfer_op,
+    const TransferMaterializationInfo* transfer_info) {
+  if (!transfer_info) return false;
+
+  bool is_gather = (transfer_info->dest_private_resource != nullptr);
+  auto params = materializeTransferParams(*transfer_info);
+
+  // Cloned-verbatim operands (common to both gather and scatter).
+  mlir::Value ind_src_memref =
+      ind_transfer_op.getIndSrcMemref()
+          ? materializeValue(ind_transfer_op.getIndSrcMemref())
+          : mlir::Value{};
+  mlir::Value ind_src_index =
+      ind_transfer_op.getIndSrcIndex()
+          ? materializeValue(ind_transfer_op.getIndSrcIndex())
+          : mlir::Value{};
+  mlir::Value ind_dst_memref =
+      ind_transfer_op.getIndDstMemref()
+          ? materializeValue(ind_transfer_op.getIndDstMemref())
+          : mlir::Value{};
+  mlir::Value ind_dst_index =
+      ind_transfer_op.getIndDstIndex()
+          ? materializeValue(ind_transfer_op.getIndDstIndex())
+          : mlir::Value{};
+
+  mlir::Value new_dir_src, new_dir_dst;
+  mlir::AffineMap new_dir_src_map, new_dir_dst_map;
+  llvm::SmallVector<mlir::Value> new_dir_src_indices, new_dir_dst_indices;
+  llvm::SmallVector<mlir::OpFoldResult> new_dir_src_sizes, new_dir_dst_sizes;
+
+  if (is_gather) {
+    // dir_dst is the FIFO slot → replace with L1 staging buffer.
+    // dir_src (global memref) is cloned verbatim.
+    new_dir_src = materializeValue(ind_transfer_op.getDirSrc());
+    new_dir_src_map = ind_transfer_op.getDirSrcMapAttr()
+                          ? ind_transfer_op.getDirSrcMapAttr().getValue()
+                          : mlir::AffineMap();
+    for (mlir::Value v : ind_transfer_op.getDirSrcIndices())
+      new_dir_src_indices.push_back(materializeValue(v));
+    new_dir_src_sizes = ind_transfer_op.getMixedDirSrcSizes();
+
+    new_dir_dst = getPrivateResourceValue(transfer_info->dest_private_resource,
+                                          transfer_info->dest_slot_index);
+    new_dir_dst_map = transfer_info->dest_map;
+    new_dir_dst_indices = params.dest_indices;
+    new_dir_dst_sizes = params.dest_sizes;
+  } else {
+    // dir_src is the FIFO slot → replace with L1 staging buffer.
+    // dir_dst (global memref) is cloned verbatim.
+    new_dir_src =
+        getPrivateResourceValue(transfer_info->source_private_resource,
+                                transfer_info->source_slot_index);
+    new_dir_src_map = transfer_info->source_map;
+    new_dir_src_indices = params.source_indices;
+    new_dir_src_sizes = params.source_sizes;
+
+    new_dir_dst = materializeValue(ind_transfer_op.getDirDst());
+    new_dir_dst_map = ind_transfer_op.getDirDstMapAttr()
+                          ? ind_transfer_op.getDirDstMapAttr().getValue()
+                          : mlir::AffineMap();
+    for (mlir::Value v : ind_transfer_op.getDirDstIndices())
+      new_dir_dst_indices.push_back(materializeValue(v));
+    new_dir_dst_sizes = ind_transfer_op.getMixedDirDstSizes();
+  }
+
+  mlir::ktdf::IndDataTransferOp::create(
+      builder_, ind_transfer_op.getLoc(), ind_src_memref, ind_src_index,
+      new_dir_src, new_dir_src_map, new_dir_src_indices, new_dir_src_sizes,
+      ind_dst_memref, ind_dst_index, new_dir_dst, new_dir_dst_map,
+      new_dir_dst_indices, new_dir_dst_sizes);
+
+  return true;
+}
+
 bool PathExpansionMaterializer::tryAdaptReadFromFifoOp(
     mlir::ktdf::ReadFromFifoOp read_op,
     const TransferMaterializationInfo* transfer_info) {
@@ -660,6 +735,10 @@ void PathExpansionMaterializer::adaptStageBodyWithTransfers(
     bool adapted = false;
     if (auto transfer_op = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(&op)) {
       adapted = tryAdaptDataTransferOp(transfer_op, transfer_map.lookup(&op));
+    } else if (auto ind_transfer_op =
+                   mlir::dyn_cast<mlir::ktdf::IndDataTransferOp>(&op)) {
+      adapted =
+          tryAdaptIndDataTransferOp(ind_transfer_op, transfer_map.lookup(&op));
     } else if (handle_fifo_ops) {
       if (auto read_op = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(&op)) {
         adapted = tryAdaptReadFromFifoOp(read_op, transfer_map.lookup(&op));
