@@ -54,7 +54,8 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     supplied by an entry in the indirect address buffer (IAB), selected by
     `$ind_addr_buf_subscripts` into `$ind_addr_buf_memref`, and the remaining
     dimensions are expressed as direct element offsets into `$base` via
-    `$direct_subscripts`.
+    `$direct_subscripts`.  In all other respects the semantics of this op are
+    inherited from `ktdp.construct_indirect_access_tile`.
 
     **Semantics of `base_ptr = %iab_mv[%s0, %s1, ...]`:**  the `index` value
     stored at those subscripts in the IAB memref is added as an element-offset
@@ -115,7 +116,10 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     Variadic<Index>:$direct_subscripts,
     // Intermediate variables that parameterise the tile shape via
     // variables_space_set; may also appear in ind_addr_buf_subscripts
-    // and direct_subscripts.
+    // and direct_subscripts.  These operands play the same role as
+    // the hidden-region block arguments used by the ktdp variant: they 
+    // represent the loop-like iteration variables that enumerate points 
+    // in the variable space defined by variables_space_set.
     Variadic<Index>:$intermediate_variables,
     AffineMapAttr:$variables_space_order,
     Builtin_IntegerSetAttr:$variables_space_set
