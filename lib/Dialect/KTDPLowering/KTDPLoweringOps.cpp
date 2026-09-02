@@ -151,3 +151,9 @@ LogicalResult ConstructMemoryViewOp::verify() {
 
   return success();
 }
+
+//===----------------------------------------------------------------------===//
+// ConstructMemoryViewOp — ViewLikeOpInterface
+//===----------------------------------------------------------------------===//
+
+mlir::Value ConstructMemoryViewOp::getViewSource() { return getOffset(); }

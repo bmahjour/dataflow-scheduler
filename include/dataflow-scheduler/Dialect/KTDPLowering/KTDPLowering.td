@@ -139,6 +139,7 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
 def KTDPLowering_ConstructMemoryViewOp :
     KTDPLowering_Op<"construct_memory_view", [
       AttrSizedOperandSegments,
+      DeclareOpInterfaceMethods<ViewLikeOpInterface>,
       MemRefsNormalizable,
       Pure
     ]> {
