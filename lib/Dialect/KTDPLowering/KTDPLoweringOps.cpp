@@ -340,6 +340,11 @@ void ConstructIndirectAccessTileOp::print(OpAsmPrinter& p) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult ConstructIndirectAccessTileOp::verify() {
+  // The region must be empty (only the implicit terminator is allowed).
+  Block& body = getRegion().front();
+  if (!body.without_terminator().empty())
+    return emitOpError("region must be empty (only the terminator is allowed)");
+
   auto iabType = mlir::cast<MemRefType>(getIndAddrBufMemref().getType());
   unsigned unifiedDims =
       getCapturedVariables().size() + getIntermediateVariables().size();
