@@ -141,9 +141,11 @@ const PrivateResourceAllocation* PrivateResourceFactory::getAllocation(
 //===----------------------------------------------------------------------===//
 
 namespace {
-/// Per-operand data extracted from either a DataTransferOp or an
-/// IndDataTransferOp — whichever side is the non-buffer (FIFO or memref)
-/// operand of the template operation.
+/// Per-operand indexing and layout metadata extracted from a template
+/// DataTransferOp or IndDataTransferOp. Used when constructing multi-hop
+/// transfers where one endpoint is an intermediate staging buffer and the other
+/// endpoint preserves the original template's source or destination (FIFO or
+/// memref).
 struct TemplateTransferSides {
   // Indices/sizes/map for the source side of the template op.
   llvm::SmallVector<mlir::Value> src_indices;

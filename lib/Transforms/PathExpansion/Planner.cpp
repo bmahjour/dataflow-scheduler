@@ -770,8 +770,9 @@ static mlir::LogicalResult classifyOriginalStages(
         mlir::cast<mlir::ktdf::StageOp>(current_stage->getOperation());
 
     // --- Transfer stage (kAdaptTransfer): memref/FIFO ↔ intermediate buffer
-    // --- Shared helper: given a template op, its buffer-side element type and
-    // tile sizes, and which neighbor is intermediate, create the buffer spec,
+    // --- Shared helper: given a template op, its intermediate-buffer-side
+    // element type and tile sizes, and which neighbor is intermediate, create
+    // the intermediate buffer spec,
     // build the edge, and register the TransferMaterializationInfo.
     auto classifyTransferStage = [&](mlir::Operation* template_op,
                                      mlir::Type element_type,
@@ -994,8 +995,9 @@ static mlir::LogicalResult populateIntermediateStageTransfers(
     StageMaterializationInfo& prev_info = prev_it->second;
     StageMaterializationInfo& next_info = plan->stage_info[next_stage];
 
-    // Adjacent buffer transfers record the memory resource (stage_resource) as
-    // their endpoint. Adjacent FIFO transfers record the LS unit
+    // Adjacent intermediate memory buffer transfers record the memory resource
+    // (stage_resource) as their endpoint. Adjacent FIFO transfers record the LS
+    // unit
     // (applicable_unit). Accept either when matching transfers from neighbours.
     ResourceType ls_unit = stage_info.applicable_unit.value_or(nullptr);
     auto matchesIntermediate = [&](ResourceType r) -> bool {

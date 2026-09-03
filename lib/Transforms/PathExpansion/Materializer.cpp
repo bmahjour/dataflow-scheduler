@@ -607,7 +607,7 @@ bool PathExpansionMaterializer::tryAdaptIndDataTransferOp(
     const TransferMaterializationInfo* transfer_info) {
   if (!transfer_info) return false;
 
-  bool is_gather = (transfer_info->dest_private_resource != nullptr);
+  bool is_gather = ind_transfer_op.isGather();
   auto params = materializeTransferParams(*transfer_info);
 
   // Cloned-verbatim operands (common to both gather and scatter).
