@@ -822,38 +822,21 @@ static mlir::LogicalResult classifyOriginalStages(
       stage_info.kind = StageMaterializationInfo::Kind::kAdaptTransfer;
     };
 
-    // Direct transfer: exactly one side is a memref (the other is a FIFO).
-    // The IBR-fill DataTransferOp (both sides memref) is skipped by the guard.
-    stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
-      mlir::Type src_type = transfer.getSource().getType();
-      mlir::Type dest_type = transfer.getDestination().getType();
-
-      bool src_is_memref = mlir::isa<mlir::MemRefType>(src_type);
-      bool dest_is_memref = mlir::isa<mlir::MemRefType>(dest_type);
-
-      if (src_is_memref == dest_is_memref) return mlir::WalkResult::advance();
-
-      mlir::MemRefType memref_type =
-          src_is_memref ? mlir::cast<mlir::MemRefType>(src_type)
-                        : mlir::cast<mlir::MemRefType>(dest_type);
-      llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
-          src_is_memref ? transfer.getMixedSourceSizes()
-                        : transfer.getMixedDestSizes();
-
-      classifyTransferStage(transfer.getOperation(),
-                            memref_type.getElementType(), tile_sizes,
-                            /*intermediate_is_source=*/prev_is_intermediate);
-      return mlir::WalkResult::advance();
-    });
-
     // Indirect transfer: dir_dst (gather) or dir_src (scatter) is the FIFO
     // slot that gets replaced by the L1 staging buffer.
+    // Run this walk first so the stage is classified before the DataTransferOp
+    // walk below, preventing double-classification when both op types coexist.
     stage_op.walk([&](mlir::ktdf::IndDataTransferOp ind_transfer) {
       bool is_gather = ind_transfer.isGather();
       mlir::Value fifo_side =
           is_gather ? ind_transfer.getDirDst() : ind_transfer.getDirSrc();
       auto fifo_slot_type =
-          mlir::cast<mlir::ktdf::FifoSlotType>(fifo_side.getType());
+          mlir::dyn_cast<mlir::ktdf::FifoSlotType>(fifo_side.getType());
+      if (!fifo_slot_type) {
+        ind_transfer.emitError("expected FifoSlotType on ")
+            << (is_gather ? "dir_dst" : "dir_src") << " of IndDataTransferOp";
+        return mlir::WalkResult::advance();
+      }
       llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
           is_gather ? ind_transfer.getMixedDirDstSizes()
                     : ind_transfer.getMixedDirSrcSizes();
@@ -863,6 +846,33 @@ static mlir::LogicalResult classifyOriginalStages(
                             /*intermediate_is_source=*/prev_is_intermediate);
       return mlir::WalkResult::advance();
     });
+
+    // Direct transfer: exactly one side is a memref (the other is a FIFO).
+    // The IBR-fill DataTransferOp (both sides memref) is skipped by the guard.
+    // Skip entirely if an IndDataTransferOp already classified this stage.
+    if (stage_info.kind != StageMaterializationInfo::Kind::kAdaptTransfer) {
+      stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
+        mlir::Type src_type = transfer.getSource().getType();
+        mlir::Type dest_type = transfer.getDestination().getType();
+
+        bool src_is_memref = mlir::isa<mlir::MemRefType>(src_type);
+        bool dest_is_memref = mlir::isa<mlir::MemRefType>(dest_type);
+
+        if (src_is_memref == dest_is_memref) return mlir::WalkResult::advance();
+
+        mlir::MemRefType memref_type =
+            src_is_memref ? mlir::cast<mlir::MemRefType>(src_type)
+                          : mlir::cast<mlir::MemRefType>(dest_type);
+        llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
+            src_is_memref ? transfer.getMixedSourceSizes()
+                          : transfer.getMixedDestSizes();
+
+        classifyTransferStage(transfer.getOperation(),
+                              memref_type.getElementType(), tile_sizes,
+                              /*intermediate_is_source=*/prev_is_intermediate);
+        return mlir::WalkResult::advance();
+      });
+    }
 
     // --- Compute stage (kAdaptFifoKinds): read_from_fifo / write_to_fifo ---
     stage_op.walk([&](mlir::Operation* op) {

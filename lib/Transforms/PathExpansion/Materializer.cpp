@@ -642,7 +642,8 @@ bool PathExpansionMaterializer::tryAdaptIndDataTransferOp(
                           : mlir::AffineMap();
     for (mlir::Value v : ind_transfer_op.getDirSrcIndices())
       new_dir_src_indices.push_back(materializeValue(v));
-    new_dir_src_sizes = ind_transfer_op.getMixedDirSrcSizes();
+    for (mlir::OpFoldResult s : ind_transfer_op.getMixedDirSrcSizes())
+      new_dir_src_sizes.push_back(materializeOpFoldResult(s));
 
     new_dir_dst = getPrivateResourceValue(transfer_info->dest_private_resource,
                                           transfer_info->dest_slot_index);
@@ -665,7 +666,8 @@ bool PathExpansionMaterializer::tryAdaptIndDataTransferOp(
                           : mlir::AffineMap();
     for (mlir::Value v : ind_transfer_op.getDirDstIndices())
       new_dir_dst_indices.push_back(materializeValue(v));
-    new_dir_dst_sizes = ind_transfer_op.getMixedDirDstSizes();
+    for (mlir::OpFoldResult s : ind_transfer_op.getMixedDirDstSizes())
+      new_dir_dst_sizes.push_back(materializeOpFoldResult(s));
   }
 
   mlir::ktdf::IndDataTransferOp::create(
@@ -737,6 +739,13 @@ void PathExpansionMaterializer::adaptStageBodyWithTransfers(
       adapted = tryAdaptDataTransferOp(transfer_op, transfer_map.lookup(&op));
     } else if (auto ind_transfer_op =
                    mlir::dyn_cast<mlir::ktdf::IndDataTransferOp>(&op)) {
+      // IndDataTransferOp is a transfer-path op, not a FIFO op. It must only
+      // be reached when handle_fifo_ops == false (i.e., the transfer-adapt
+      // path). If called from a FIFO-handling context, transfer_map will have
+      // no entry and tryAdaptIndDataTransferOp would silently clone as-is,
+      // producing wrong output.
+      assert(!handle_fifo_ops &&
+             "IndDataTransferOp must not appear in a FIFO-handling stage");
       adapted =
           tryAdaptIndDataTransferOp(ind_transfer_op, transfer_map.lookup(&op));
     } else if (handle_fifo_ops) {
