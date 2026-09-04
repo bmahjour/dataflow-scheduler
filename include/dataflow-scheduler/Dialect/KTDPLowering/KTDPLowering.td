@@ -47,8 +47,7 @@ class KTDPLowering_Op<string mnemonic, list<Trait> traits = []> :
 
 def KTDPLowering_ConstructIndirectAccessTileOp :
     KTDPLowering_Op<"construct_indirect_access_tile",
-                    [SingleBlockImplicitTerminator<"ktdp::RegionTerminatorOp">,
-                     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+                    [SingleBlockImplicitTerminator<"ktdp::RegionTerminatorOp">]> {
 
   let summary = "indirect access tile with indirection factored into an IAB "
                 "base address and direct element offsets";
@@ -74,11 +73,11 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     `$ind_addr_buf_subscripts` are plain SSA `index` values — each one is
     either a block argument of `$region` (an intermediate variable) or a
     member of `$captured_variables` (an outer loop IV or constant).  No affine
-    map is needed here because the IAB entry already holds a *flat absolute
-    byte address* computed by `spyreop.idx32toaddr` in the preceding
-    index-to-address compute group; the subscript merely selects *which*
-    pre-computed address to use, and that selection is always a bare loop
-    variable, never an arithmetic expression.
+    map is needed here because the subscript is used directly as an index into
+    `$ind_addr_buf_memref`; the address buffer lookup itself supplies the
+    selected address, so the subscript only needs to identify which entry to
+    read.  Note that even at the KTDP level, an affine map is not applied to
+    the value loaded from an indirect subscript either.
 
     `$per_dim_subscript_maps` are affine maps over the unified dimension space
     `(captured_variables..., intermediate_variables...)`.  They *can* contain
@@ -92,12 +91,12 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     **Semantics of `base_ptr = %iab_mv[%s0, %s1, ...]`:**  the flat address
     value stored at those subscripts in the IAB memref is added as an
     element-offset delta to the address computed from `$base`'s
-    `construct_memory_view` base together with `$per_dim_subscript_maps`.
-    Concretely, if the `ind()` dimension of `$base` had stride `S`, the IAB
-    entry stores `original_index * S`, and the corresponding map for that
-    dimension evaluates to `0` (contributing `0 * S = 0`).  The two terms
-    together reproduce the original indirect address without double-counting:
-    `flat = cmv_base + iab[s0,s1,...] + map0(...)*S0 + map1(...)*S1 + ...`
+    `construct_memory_view` base.  The IAB value already represents the
+    complete contribution of the indirect dimensions; no stride or affine
+    subscript map is applied to an indirect subscript or to the value loaded
+    from it.  `$per_dim_subscript_maps` contribute only the coordinates for
+    direct dimensions, whose strides are applied by the hardware memory unit:
+    `flat = cmv_base + iab[s0,s1,...] + direct_map0(...)*S0 + ...`
 
     The `$variables_space_set` defines the tile shape.
     `ConstructThreeStagePipeline` reads it to determine the element count of
@@ -144,8 +143,7 @@ def KTDPLowering_ConstructIndirectAccessTileOp :
     // IAB memory view (the memory space is architecture-defined;
     // the verifier checks that ind_addr_buf_dim_positions.size() == rank of this
     // memref).
-    // Read effect is declared via DeclareOpInterfaceMethods<MemoryEffectsOpInterface>.
-    AnyMemRef:$ind_addr_buf_memref,
+    Arg<AnyMemRef, "indirect address buffer", [MemRead]>:$ind_addr_buf_memref,
     // One integer per IAB dimension giving its position in the unified
     // (captured_variables..., intermediate_variables...) ordering.  No operand
     // is needed because each IAB subscript is always a direct use of exactly

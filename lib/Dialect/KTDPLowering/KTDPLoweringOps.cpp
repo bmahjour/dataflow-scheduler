@@ -51,19 +51,6 @@ void KTDPLoweringDialect::registerOps() {
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.cpp.inc"
 
 //===----------------------------------------------------------------------===//
-// ConstructIndirectAccessTileOp — memory effects
-//===----------------------------------------------------------------------===//
-
-void ConstructIndirectAccessTileOp::getEffects(
-    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>&
-        effects) {
-  // The op reads from ind_addr_buf_memref to obtain the pre-computed base
-  // address; it does not write to any memory.
-  effects.emplace_back(MemoryEffects::Read::get(),
-                       SideEffects::DefaultResource::get());
-}
-
-//===----------------------------------------------------------------------===//
 // ConstructIndirectAccessTileOp — builder
 //===----------------------------------------------------------------------===//
 
