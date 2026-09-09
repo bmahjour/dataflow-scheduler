@@ -28,7 +28,6 @@ include "mlir/IR/OpBase.td"
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
-include "mlir/Interfaces/ControlFlowInterfaces.td"
 
 include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLoweringDialect.td"
 

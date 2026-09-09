@@ -79,21 +79,17 @@ void ConstructIndirectAccessTileOp::build(
   result.addOperands(base);
   result.addOperands(indAddrBufMemref);
   result.addOperands(capturedVariables);
-  result.addAttribute(getIndAddrBufDimPositionsAttrName(result.name),
-                      indAddrBufDimPositions);
-  result.addAttribute(getPerDimSubscriptMapsAttrName(result.name),
-                      perDimSubscriptMaps);
-  result.addAttribute(getVariablesSpaceOrderAttrName(result.name),
-                      AffineMapAttr::get(variablesSpaceOrder));
-  result.addAttribute(getVariablesSpaceSetAttrName(result.name),
-                      IntegerSetAttr::get(variablesSpaceSet));
+  auto& props = result.getOrAddProperties<Properties>();
+  props.ind_addr_buf_dim_positions = indAddrBufDimPositions;
+  props.per_dim_subscript_maps = perDimSubscriptMaps;
+  props.variables_space_order = AffineMapAttr::get(variablesSpaceOrder);
+  props.variables_space_set = IntegerSetAttr::get(variablesSpaceSet);
 
   // Hidden region: one index-typed block arg per intermediate variable.
   // ensureTerminator is called before adding block arguments, matching the
   // pattern established by ConstructIndirectAccessTilesOp in the ktdp dialect.
   Region* region = result.addRegion();
-  region->push_back(new Block);
-  Block& body = region->front();
+  Block& body = region->emplaceBlock();
   ensureTerminator(*region, builder, builder.getUnknownLoc());
   for (unsigned i = 0; i < numIntermediateVariables; ++i)
     body.addArgument(builder.getIndexType(), builder.getUnknownLoc());
@@ -144,29 +140,27 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
       parser.parseOperandList(iabSubscriptNames) || parser.parseRSquare())
     return failure();
 
-  // --- %base[(affine-expr), ...] ---
+  // --- %base[affine-expr, ...] ---
   OpAsmParser::UnresolvedOperand base;
-  if (parser.parseOperand(base) || parser.parseLSquare()) return failure();
+  if (parser.parseOperand(base)) return failure();
 
   SmallVector<AffineMapAttr> rawMaps;
   SmallVector<SmallVector<OpAsmParser::UnresolvedOperand>> rawMapOperands;
-  while (parser.parseOptionalRSquare()) {
-    if (!rawMaps.empty() && parser.parseComma()) return failure();
+  if (parser.parseCommaSeparatedList(AsmParser::Delimiter::Square, [&]() {
+        SmallVector<OpAsmParser::UnresolvedOperand> dimOps;
+        SmallVector<OpAsmParser::UnresolvedOperand> symOps;
+        AffineExpr expr;
+        if (parser.parseAffineExprOfSSAIds(dimOps, symOps, expr))
+          return failure();
 
-    // Guard against infinite loops: ensure progress was made each iteration.
-    auto startLoc = parser.getCurrentLocation();
-    AffineMapAttr mapAttr;
-    SmallVector<OpAsmParser::UnresolvedOperand> mapOps;
-    if (parser.parseAffineMapOfSSAIds(mapOps, mapAttr, "per_dim_subscript_maps",
-                                      result.attributes,
-                                      AsmParser::Delimiter::Paren))
-      return failure();
-    if (parser.getCurrentLocation() == startLoc)
-      return parser.emitError(startLoc)
-             << "unexpected token in subscript list, expected '(' or ']'";
-    rawMaps.push_back(mapAttr);
-    rawMapOperands.push_back(mapOps);
-  }
+        SmallVector<OpAsmParser::UnresolvedOperand> mapOps(dimOps);
+        mapOps.append(symOps.begin(), symOps.end());
+        rawMaps.push_back(AffineMapAttr::get(
+            AffineMap::get(dimOps.size(), symOps.size(), expr, ctx)));
+        rawMapOperands.push_back(mapOps);
+        return success();
+      }))
+    return failure();
   result.attributes.clear();  // remove temporaries from parseAffineMapOfSSAIds
 
   // --- optional attr-dict ---
@@ -192,7 +186,7 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
   SmallVector<StringRef> capturedNames;
   llvm::SmallDenseSet<StringRef> capturedSeen;
   auto maybeCapture = [&](StringRef name) {
-    if (!ivNameSet.count(name) && capturedSeen.insert(name).second)
+    if (!ivNameSet.contains(name) && capturedSeen.insert(name).second)
       capturedNames.push_back(name);
   };
   for (auto& ops : rawMapOperands)
@@ -231,16 +225,14 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
     // raw(localDims...) . remap(unifiedDims...) => canonical(unifiedDims...)
     canonicalMaps.push_back(AffineMapAttr::get(raw.compose(remap)));
   }
-  result.addAttribute(getPerDimSubscriptMapsAttrName(result.name),
-                      builder.getArrayAttr(canonicalMaps));
+  auto& props = result.getOrAddProperties<Properties>();
+  props.per_dim_subscript_maps = builder.getArrayAttr(canonicalMaps);
 
   // Build the hidden region with one block arg per intermediate variable.
   // Region is added after parsing is complete, matching the ktdp variant's
   // ordering. ensureTerminator is called before adding block arguments.
-  result.regions.reserve(1);
   Region* region = result.addRegion();
-  region->push_back(new Block);
-  Block& body = region->front();
+  Block& body = region->emplaceBlock();
   ensureTerminator(*region, builder, result.location);
   for (size_t i = 0; i < ivNames.size(); ++i)
     body.addArgument(builder.getIndexType(), builder.getUnknownLoc());
@@ -255,8 +247,7 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
              << "' is neither a captured variable nor an intermediate variable";
     iabPositions.push_back(static_cast<int32_t>(it->second));
   }
-  result.addAttribute(getIndAddrBufDimPositionsAttrName(result.name),
-                      builder.getDenseI32ArrayAttr(iabPositions));
+  props.ind_addr_buf_dim_positions = builder.getDenseI32ArrayAttr(iabPositions);
 
   // --- Resolve operands ---
   if (parser.resolveOperand(base, baseType, result.operands) ||
@@ -279,7 +270,7 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
                              result.operands))
     return failure();
 
-  if (parser.addTypeToList(resultType, result.types)) return failure();
+  result.addTypes(resultType);
   return success();
 }
 
@@ -302,14 +293,12 @@ void ConstructIndirectAccessTileOp::print(OpAsmPrinter& p) {
   });
   p << "]";
 
-  // %base[(affine-expr), ...]
+  // %base[affine-expr, ...]
   p << " " << getBase() << "[";
   auto maps = getPerDimSubscriptMaps();
   for (unsigned i = 0, e = maps.size(); i < e; ++i) {
     if (i > 0) p << ", ";
-    p << "(";
     p.printAffineMapOfSSAIds(llvm::cast<AffineMapAttr>(maps[i]), allVars);
-    p << ")";
   }
   p << "]";
 
