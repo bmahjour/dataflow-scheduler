@@ -24,6 +24,7 @@
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 // clang-format on
 
+#include <llvm/ADT/SetVector.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/DialectImplementation.h>
 #include <mlir/IR/OpImplementation.h>
@@ -176,31 +177,27 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
   // --- Determine the unified variable ordering (captured..., intermediate...)
   // --- Captured variables: SSA names referenced in per-dim maps or IAB
   // subscripts that are NOT in the intermediate-variables list.
-  llvm::SmallDenseSet<StringRef> ivNameSet;
-  SmallVector<StringRef> ivNameVec;
-  for (auto& iv : ivNames) {
-    ivNameSet.insert(iv.name);
-    ivNameVec.push_back(iv.name);
-  }
+  llvm::SmallSetVector<StringRef, 8> ivNameSV;
+  for (auto& iv : ivNames) ivNameSV.insert(iv.name);
 
   SmallVector<StringRef> capturedNames;
   llvm::SmallDenseSet<StringRef> capturedSeen;
   auto maybeCapture = [&](StringRef name) {
-    if (!ivNameSet.contains(name) && capturedSeen.insert(name).second)
+    if (!ivNameSV.contains(name) && capturedSeen.insert(name).second)
       capturedNames.push_back(name);
   };
   for (auto& ops : rawMapOperands)
     for (auto& op : ops) maybeCapture(op.name);
   for (auto& sub : iabSubscriptNames) maybeCapture(sub.name);
 
-  unsigned unifiedDims = capturedNames.size() + ivNameVec.size();
+  unsigned unifiedDims = capturedNames.size() + ivNameSV.size();
 
   // Build a position map from name → unified dim index.
   llvm::SmallDenseMap<StringRef, unsigned> posMap;
   for (unsigned c = 0; c < capturedNames.size(); ++c)
     posMap[capturedNames[c]] = c;
-  for (unsigned v = 0; v < ivNameVec.size(); ++v)
-    posMap[ivNameVec[v]] = capturedNames.size() + v;
+  for (unsigned v = 0; v < ivNameSV.size(); ++v)
+    posMap[ivNameSV[v]] = capturedNames.size() + v;
 
   // --- Canonicalize per-dim subscript maps to the unified dimension space ---
   // Strategy: build a "remap" map from the unified domain to each map's local
@@ -260,7 +257,7 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
     llvm::SmallDenseSet<StringRef> resolvedSeen;
     auto collect = [&](llvm::ArrayRef<OpAsmParser::UnresolvedOperand> ops) {
       for (auto& op : ops)
-        if (!ivNameSet.count(op.name) && resolvedSeen.insert(op.name).second)
+        if (!ivNameSV.count(op.name) && resolvedSeen.insert(op.name).second)
           capturedResolvable.push_back(op);
     };
     for (auto& ops : rawMapOperands) collect(ops);
