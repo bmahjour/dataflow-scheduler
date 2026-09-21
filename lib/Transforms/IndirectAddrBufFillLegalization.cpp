@@ -77,14 +77,6 @@ using RoutingGraph = arch_view::RoutingGraph;
 // Architecture Queries
 //===----------------------------------------------------------------------===//
 
-/// All nodes standing for resources of kind \p kind. A kind may appear more
-/// than once: the routing graph keeps one node per declaration, and a unit or
-/// memory declared in several sub-cores is several nodes.
-llvm::ArrayRef<RoutingGraph::NodeId> nodesOfKind(const RoutingGraph& graph,
-                                                 mlir::Attribute kind) {
-  return graph.getNodeIdsForResource(kind);
-}
-
 /// The memories \p unit_kind has an incoming datapath from -- the memories it
 /// can legitimately read. \p exclude is left out of the result; it is the
 /// address buffer itself, which is co-located rather than routed to.
@@ -92,7 +84,7 @@ llvm::SmallVector<mlir::Attribute> memoriesFeeding(const RoutingGraph& graph,
                                                    mlir::Attribute unit_kind,
                                                    mlir::Attribute exclude) {
   llvm::SmallSetVector<mlir::Attribute, 4> result;
-  for (RoutingGraph::NodeId unit : nodesOfKind(graph, unit_kind)) {
+  for (RoutingGraph::NodeId unit : graph.getNodeIdsForResource(unit_kind)) {
     for (RoutingGraph::NodeId candidate : graph.getAllNodeIds()) {
       auto node = graph.getNode(candidate);
       if (!node ||
@@ -110,10 +102,10 @@ llvm::SmallVector<mlir::Attribute> memoriesFeeding(const RoutingGraph& graph,
 /// incoming datapath from \p source and an outgoing one to \p dest.
 bool unitConnects(const RoutingGraph& graph, mlir::Attribute unit_kind,
                   mlir::Attribute source, mlir::Attribute dest) {
-  for (RoutingGraph::NodeId unit : nodesOfKind(graph, unit_kind)) {
-    for (RoutingGraph::NodeId from : nodesOfKind(graph, source)) {
+  for (RoutingGraph::NodeId unit : graph.getNodeIdsForResource(unit_kind)) {
+    for (RoutingGraph::NodeId from : graph.getNodeIdsForResource(source)) {
       if (!graph.getEdgeInfo(from, unit)) continue;
-      for (RoutingGraph::NodeId to : nodesOfKind(graph, dest)) {
+      for (RoutingGraph::NodeId to : graph.getNodeIdsForResource(dest)) {
         if (graph.getEdgeInfo(unit, to)) return true;
       }
     }
