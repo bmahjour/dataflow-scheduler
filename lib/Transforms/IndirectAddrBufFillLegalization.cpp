@@ -80,10 +80,10 @@ using RoutingGraph = arch_view::RoutingGraph;
 /// The memories \p unit_kind has an incoming datapath from -- the memories it
 /// can legitimately read. \p exclude is left out of the result; it is the
 /// address buffer itself, which is co-located rather than routed to.
-llvm::SmallVector<mlir::Attribute> memoriesFeeding(const RoutingGraph& graph,
-                                                   mlir::Attribute unit_kind,
-                                                   mlir::Attribute exclude) {
-  llvm::SmallSetVector<mlir::Attribute, 4> result;
+llvm::SmallVector<ResourceType> memoriesFeeding(const RoutingGraph& graph,
+                                                ResourceType unit_kind,
+                                                ResourceType exclude) {
+  llvm::SmallSetVector<ResourceType, 4> result;
   for (RoutingGraph::NodeId unit : graph.getNodeIdsForResource(unit_kind)) {
     for (RoutingGraph::NodeId candidate : graph.getAllNodeIds()) {
       auto node = graph.getNode(candidate);
@@ -100,8 +100,8 @@ llvm::SmallVector<mlir::Attribute> memoriesFeeding(const RoutingGraph& graph,
 
 /// Whether \p unit_kind can carry data from \p source to \p dest, i.e. has an
 /// incoming datapath from \p source and an outgoing one to \p dest.
-bool unitConnects(const RoutingGraph& graph, mlir::Attribute unit_kind,
-                  mlir::Attribute source, mlir::Attribute dest) {
+bool unitConnects(const RoutingGraph& graph, ResourceType unit_kind,
+                  ResourceType source, ResourceType dest) {
   for (RoutingGraph::NodeId unit : graph.getNodeIdsForResource(unit_kind)) {
     for (RoutingGraph::NodeId from : graph.getNodeIdsForResource(source)) {
       if (!graph.getEdgeInfo(from, unit)) continue;
@@ -115,10 +115,10 @@ bool unitConnects(const RoutingGraph& graph, mlir::Attribute unit_kind,
 
 /// The single unit \p stage is mapped to, or null if it is not mapped to
 /// exactly one.
-mlir::Attribute getStageUnit(mlir::ktdf::StageOp stage) {
+ResourceType getStageUnit(mlir::ktdf::StageOp stage) {
   const auto units = stage.getApplicableUnits();
   if (!units || units->size() != 1) return nullptr;
-  return units->getValue().front();
+  return mlir::dyn_cast_if_present<ResourceType>(units->getValue().front());
 }
 
 //===----------------------------------------------------------------------===//
@@ -134,7 +134,7 @@ struct FillSite {
 
 /// Whether \p space is the memory space of an indirect address buffer.
 bool isAddressBufferSpace(const mlir::ktdf_arch::ResourceKinds& resource_kinds,
-                          mlir::Attribute space) {
+                          ResourceType space) {
   if (!space) return false;
   return resource_kinds
              .getFeature<mlir::ktdf_arch::feature::IndirectAddressBuffer>(
@@ -148,8 +148,10 @@ void collectFillSites(mlir::ktdf::PipelineOp pipeline,
     stage.walk([&](mlir::ktdf::DataTransferOp transfer) {
       auto dest =
           mlir::dyn_cast<mlir::MemRefType>(transfer.getDestination().getType());
-      if (!dest || !isAddressBufferSpace(resource_kinds, dest.getMemorySpace()))
-        return;
+      if (!dest) return;
+      auto space =
+          mlir::dyn_cast_if_present<ResourceType>(dest.getMemorySpace());
+      if (!space || !isAddressBufferSpace(resource_kinds, space)) return;
       sites.push_back({transfer, stage});
     });
   }
@@ -255,11 +257,11 @@ mlir::LogicalResult collectGuards(
 mlir::ktdf::StageOp findStagingStage(mlir::ktdf::PipelineOp pipeline,
                                      mlir::ktdf::StageOp fill_stage,
                                      const RoutingGraph& graph,
-                                     mlir::Attribute source,
-                                     mlir::Attribute staging) {
+                                     ResourceType source,
+                                     ResourceType staging) {
   for (mlir::ktdf::StageOp stage : pipeline.getStages()) {
     if (stage == fill_stage) break;
-    mlir::Attribute unit = getStageUnit(stage);
+    ResourceType unit = getStageUnit(stage);
     if (unit && unitConnects(graph, unit, source, staging)) return stage;
   }
   return nullptr;
@@ -274,7 +276,7 @@ mlir::LogicalResult legalizeFillSite(const FillSite& site,
   auto pipeline = stage->getParentOfType<mlir::ktdf::PipelineOp>();
   assert(pipeline && "stage must be inside a pipeline");
 
-  mlir::Attribute fill_unit = getStageUnit(stage);
+  ResourceType fill_unit = getStageUnit(stage);
   if (!fill_unit) {
     return stage.emitError()
            << PASS_NAME
@@ -284,18 +286,28 @@ mlir::LogicalResult legalizeFillSite(const FillSite& site,
 
   auto source_type =
       mlir::dyn_cast<mlir::MemRefType>(fill.getSource().getType());
-  if (!source_type || !source_type.getMemorySpace()) {
+  if (!source_type) {
     return fill.emitError()
            << PASS_NAME
            << ": indirect address buffer fill must read a memref in a known "
               "memory space";
   }
-  mlir::Attribute source_memory = source_type.getMemorySpace();
-  auto dest_memory =
+  ResourceType source_memory =
+      mlir::dyn_cast_if_present<ResourceType>(source_type.getMemorySpace());
+  if (!source_memory) {
+    return fill.emitError()
+           << PASS_NAME
+           << ": indirect address buffer fill must read a memref in a known "
+              "memory space";
+  }
+  // The destination is always a MemRefType with a KindAttr memory space:
+  // collectFillSites only admits transfers whose destination space passes
+  // isAddressBufferSpace, which rejects null and non-KindAttr spaces.
+  ResourceType dest_memory = mlir::cast<ResourceType>(
       mlir::cast<mlir::MemRefType>(fill.getDestination().getType())
-          .getMemorySpace();
+          .getMemorySpace());
 
-  llvm::SmallVector<mlir::Attribute> reachable =
+  llvm::SmallVector<ResourceType> reachable =
       memoriesFeeding(graph, fill_unit, dest_memory);
   if (llvm::is_contained(reachable, source_memory)) {
     LDBG(1) << "  fill from " << source_memory << " on " << fill_unit
@@ -309,7 +321,7 @@ mlir::LogicalResult legalizeFillSite(const FillSite& site,
            << " from " << source_memory << ": unit " << fill_unit << " reads "
            << reachable.size() << " memories, expected exactly one";
   }
-  mlir::Attribute staging_memory = reachable.front();
+  ResourceType staging_memory = reachable.front();
 
   mlir::ktdf::StageOp staging_stage =
       findStagingStage(pipeline, stage, graph, source_memory, staging_memory);
