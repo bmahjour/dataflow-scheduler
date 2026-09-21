@@ -80,14 +80,9 @@ using RoutingGraph = arch_view::RoutingGraph;
 /// All nodes standing for resources of kind \p kind. A kind may appear more
 /// than once: the routing graph keeps one node per declaration, and a unit or
 /// memory declared in several sub-cores is several nodes.
-llvm::SmallVector<RoutingGraph::NodeId> nodesOfKind(const RoutingGraph& graph,
-                                                    mlir::Attribute kind) {
-  llvm::SmallVector<RoutingGraph::NodeId> result;
-  for (RoutingGraph::NodeId node_id : graph.getAllNodeIds()) {
-    auto node = graph.getNode(node_id);
-    if (node && node->resource == kind) result.push_back(node_id);
-  }
-  return result;
+llvm::ArrayRef<RoutingGraph::NodeId> nodesOfKind(const RoutingGraph& graph,
+                                                 mlir::Attribute kind) {
+  return graph.getNodeIdsForResource(kind);
 }
 
 /// The memories \p unit_kind has an incoming datapath from -- the memories it
