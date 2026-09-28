@@ -1,4 +1,4 @@
-// RUN: dataflow-scheduler-opt -allow-unregistered-dialect %s -double-buffering | FileCheck %s
+// RUN: dataflow-scheduler-opt %s -double-buffering | FileCheck %s
 
 // CHECK-LABEL:   func.func @gather(
 // CHECK-SAME:        %[[SRC:[a-zA-Z0-9_]+]]: memref<64xf16, #ktdp.memory_space<global>>, %[[DST:[a-zA-Z0-9_]+]]: memref<64xf16, #ktdp.memory_space<global>>, %[[IAB:[a-zA-Z0-9_]+]]: memref<32xindex, #ktdp.memory_space<ct_local>>) {

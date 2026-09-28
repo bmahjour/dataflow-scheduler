@@ -19,10 +19,10 @@
 // Pass: -double-buffering
 //
 // Detects scratchpad memrefs handed off between sibling stages of a
-// ktdf.pipeline (single producer, >=1 consumer via ktdf.data_transfer) and
-// rewrites them into a ping-pong form: paired allocs hoisted outside the
-// pipeline scope, ktdf.buffer_phase + per-buffer ktdf.select_memref
-// inserted before the pipeline, and modulo(size: 2) set on the pipeline.
+// ktdf.pipeline (single producer, >=1 consumer via data transfer operations)
+// and rewrites them into a ping-pong form: paired allocs hoisted outside the
+// pipeline scope, ktdf.buffer_phase + per-buffer ktdf.select_memref inserted
+// before the pipeline, and modulo(size: 2) set on the pipeline.
 //
 //===----------------------------------------------------------------------===//
 
