@@ -38,6 +38,7 @@
 #include <mlir/Interfaces/InferTypeOpInterface.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
+#include <mlir/Transforms/RegionUtils.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -405,6 +406,8 @@ auto lowerStore(mlir::RewriterBase& rewriter, mlir::ktdp::StoreOp store,
     return store->emitError("tiling error: no data tile source");
   }
 
+  llvm::SmallVector<mlir::Operation*> ops_to_erase;
+
   // Erase all the via hops on the way to the insert_slice.
   auto insert_slice =
       llvm::dyn_cast<mlir::tensor::InsertSliceOp>(source.getOwner());
@@ -427,12 +430,32 @@ auto lowerStore(mlir::RewriterBase& rewriter, mlir::ktdp::StoreOp store,
         return loop.getBody()->getTerminator()->emitError(
             "tiling error: no data tile source");
       }
+    } else if (auto expand = llvm::dyn_cast<mlir::tensor::ExpandShapeOp>(
+                   source.getOwner());
+               expand) {
+      ops_to_erase.push_back(expand);
+      source = llvm::dyn_cast<mlir::OpResult>(expand.getSrc());
+      if (!source) {
+        return expand->emitError("tiling error: no data tile source");
+      }
     } else {
       return store->emitError("tiling error: no data tile source");
     }
 
     insert_slice =
         llvm::dyn_cast<mlir::tensor::InsertSliceOp>(source.getOwner());
+  }
+
+  // The new store is placed inside the tiled loop nest, but the access tile
+  // may be defined after that loop nest. Hoist its definition above the nest.
+  mlir::Value access_tile = store.getAccessTile();
+  if (auto* def = access_tile.getDefiningOp(); def) {
+    auto* nest = def->getBlock()->findAncestorOpInBlock(*insert_slice);
+    if (nest &&
+        failed(mlir::moveValueDefinitions(rewriter, access_tile, nest))) {
+      return store->emitError(
+          "tiling error: cannot hoist access tile above the tiled loop nest");
+    }
   }
 
   // Canonicalize the via hops, counting the store as a hop as well.
@@ -457,6 +480,9 @@ auto lowerStore(mlir::RewriterBase& rewriter, mlir::ktdp::StoreOp store,
   setThrottle(new_store, getThrottle(insert_slice.getSourceMutable()));
 
   rewriter.eraseOp(store);
+  for (auto* op : ops_to_erase) {
+    rewriter.eraseOp(op);
+  }
   rewriter.replaceAllUsesWith(insert_slice, insert_slice.getDest());
   rewriter.eraseOp(insert_slice);
   return new_store;
@@ -657,22 +683,59 @@ void KTIRMapAndTilePass::runOnOperation() {
   mlir::func::FuncOp func = getOperation();
   mlir::IRRewriter rewriter(func);
 
-  // Collect `ktdp.(load|store)` operations and linalg operations.
-  llvm::SmallVector<mlir::ktdp::LoadOp> loads;
-  llvm::SmallVector<mlir::ktdp::StoreOp> stores;
+  // Collect linalg compute operations.
   llvm::SmallVector<mlir::linalg::LinalgOp> computes;
-  func.walk([&](mlir::Operation* op) {
-    if (auto load = mlir::dyn_cast<mlir::ktdp::LoadOp>(op); load) {
-      loads.push_back(load);
-    } else if (auto store = mlir::dyn_cast<mlir::ktdp::StoreOp>(op); store) {
-      stores.push_back(store);
-    } else if (auto compute = mlir::dyn_cast<mlir::linalg::GenericOp>(op);
-               compute) {
-      computes.push_back(compute);
-    }
-  });
+  func.walk(
+      [&](mlir::linalg::GenericOp compute) { computes.push_back(compute); });
   if (computes.empty()) {
     return;
+  }
+
+  // Collect only `ktdp.load` ops that feed into a compute operation and
+  // `ktdp.store` ops that originate from a compute operation.
+  llvm::SmallVector<mlir::ktdp::LoadOp> loads;
+  llvm::SmallVector<mlir::ktdp::StoreOp> stores;
+
+  for (auto compute : computes) {
+    // Trace backward from compute inputs to find feeding ktdp.load ops.
+    for (mlir::OpOperand* input : compute.getDpsInputOperands()) {
+      mlir::Value val = input->get();
+      while (val) {
+        if (auto load = val.getDefiningOp<mlir::ktdp::LoadOp>()) {
+          if (!llvm::is_contained(loads, load)) {
+            loads.push_back(load);
+          }
+          break;
+        }
+        if (auto via = val.getDefiningOp<mlir::ktdf::ViaOp>()) {
+          val = via.getOperand();
+        } else if (auto extract =
+                       val.getDefiningOp<mlir::tensor::ExtractSliceOp>()) {
+          val = extract.getSource();
+        } else {
+          break;
+        }
+      }
+    }
+
+    // Trace forward from compute results to find sinking ktdp.store ops.
+    llvm::SmallVector<mlir::Value> worklist(compute->getResults().begin(),
+                                            compute->getResults().end());
+    while (!worklist.empty()) {
+      mlir::Value val = worklist.pop_back_val();
+      for (mlir::Operation* user : val.getUsers()) {
+        if (auto store = mlir::dyn_cast<mlir::ktdp::StoreOp>(user)) {
+          if (!llvm::is_contained(stores, store)) {
+            stores.push_back(store);
+          }
+        } else if (mlir::isa<mlir::ktdf::ViaOp, mlir::tensor::InsertSliceOp,
+                             mlir::tensor::ExpandShapeOp>(user)) {
+          for (mlir::Value res : user->getResults()) {
+            worklist.push_back(res);
+          }
+        }
+      }
+    }
   }
 
   // Obtain the default device and start a mapping.
@@ -733,15 +796,9 @@ void KTIRMapAndTilePass::runOnOperation() {
   stores.clear();
 
   // Remove the loop-carried dependencies altogether.
-  rewriter.setInsertionPoint(func.getBody().front().getTerminator());
   for (auto& loop_nest : loop_nests) {
     assert(!loop_nest.empty());
     dropIterArgs(rewriter, loop_nest);
-    // FIXME: Lowering the stores hoisted them into the loop, which may have
-    //        broken SSA dependencies. Moving the loops to the end of the
-    //        function will restore this, but seems questionable.
-    loop_nest.front()->remove();
-    rewriter.insert(loop_nest.front());
   }
 
   // FIXME: Since the dropIterArgs and motion transforms are shady, run the
