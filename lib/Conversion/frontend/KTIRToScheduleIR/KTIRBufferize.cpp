@@ -65,6 +65,32 @@ struct KTIRBufferizePass
   void runOnOperation() override;
 };
 
+// Strides of a memory view: taken from the construct_memory_view that
+// defines it, else from its strided layout, else the row-major strides of its
+// shape. The type of a constructed view does not carry its strides.
+auto getMemoryViewStrides(MemRef memory_view) -> llvm::SmallVector<int64_t> {
+  if (auto view =
+          memory_view.getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>()) {
+    return llvm::to_vector(view.getStaticStrides());
+  }
+  if (auto view = memory_view.getDefiningOp<
+                  mlir::ktdp_lowering::ConstructMemoryViewOp>()) {
+    return llvm::to_vector(view.getStaticStrides());
+  }
+  const auto type = memory_view.getType();
+  if (auto strided_layout =
+          mlir::dyn_cast<mlir::StridedLayoutAttr>(type.getLayout())) {
+    return llvm::to_vector(strided_layout.getStrides());
+  }
+  llvm::SmallVector<int64_t> strides(type.getRank());
+  int64_t stride = 1;
+  for (int i = type.getRank() - 1; i >= 0; --i) {
+    strides[i] = stride;
+    stride *= type.getShape()[i];
+  }
+  return strides;
+}
+
 struct LowerAccessTile
     : mlir::OpRewritePattern<mlir::ktdp::ConstructAccessTilesOp> {
   explicit LowerAccessTile(mlir::MLIRContext* context,
@@ -80,8 +106,8 @@ struct LowerAccessTile
       return rewriter.notifyMatchFailure(op, "not a memref");
     }
     if (auto* use = getSingleUse(op);
-        !use || (llvm::isa<mlir::ktdp_lowering::LoadOp>(use->getOwner()) &&
-                 llvm::isa<mlir::ktdp_lowering::StoreOp>(use->getOwner()))) {
+        !use || !llvm::isa<mlir::ktdp_lowering::LoadOp,
+                           mlir::ktdp_lowering::StoreOp>(use->getOwner())) {
       // FIXME: Use a DPS / bufferization interface.
       return rewriter.notifyMatchFailure(op, "can't bufferize users");
     }
@@ -101,19 +127,7 @@ struct LowerAccessTile
     llvm::SmallVector<int64_t> tile_dims(tile_shape.begin(), tile_shape.end());
 
     // Get strides from memory view type
-    llvm::SmallVector<int64_t> strides;
-    if (auto strided_layout = mlir::dyn_cast<mlir::StridedLayoutAttr>(
-            memory_view.getType().getLayout())) {
-      strides.assign(strided_layout.getStrides().begin(),
-                     strided_layout.getStrides().end());
-    } else {
-      // Default strides for row-major layout
-      int64_t stride = 1;
-      for (int i = memory_view.getType().getRank() - 1; i >= 0; --i) {
-        strides.insert(strides.begin(), stride);
-        stride *= memory_view.getType().getShape()[i];
-      }
-    }
+    llvm::SmallVector<int64_t> strides = getMemoryViewStrides(memory_view);
 
     // Insert the cast sequence immediately before the (now-hoisted)
     // construct_access_tile.  Both the memory view and index operands have
@@ -189,10 +203,10 @@ struct LowerAccessTile
  private:
   AttrMapping mem_space_map_;
 
-  [[nodiscard]] auto computeReinterpretCastOffset(
+  [[nodiscard]] static auto computeReinterpretCastOffset(
       mlir::OpBuilder& builder, mlir::Location loc,
       llvm::SmallVector<mlir::Value>& indices,
-      llvm::SmallVector<int64_t>& strides) const -> mlir::Value {
+      llvm::SmallVector<int64_t>& strides) -> mlir::Value {
     // Calculate offset from access tile indices and memory view strides.
     // For an access tile %A_view[%idx0, %idx1, ...] with strides [stride0,
     // stride1, ...], the offset is: %idx0 * stride0 + %idx1 * stride1 + ...
@@ -247,6 +261,86 @@ struct LowerAccessTile
   }
 };
 
+// Bufferizes the memrefs that a ktdp_lowering.construct_indirect_access_tile
+// reads, leaving the tile itself in place for its load / store to consume.
+//
+// The base memory view is cast to the mapped memory space and reinterpreted
+// over its full shape, the same way LowerAccessTile treats a direct tile's
+// view. Its subscripts stay on the op, since the indirect transfer applies
+// them, so the reinterpret_cast starts at offset 0. The indirect address
+// buffer is only cast when its memory space is remapped.
+struct LowerIndirectAccessTile
+    : mlir::OpRewritePattern<
+          mlir::ktdp_lowering::ConstructIndirectAccessTileOp> {
+  explicit LowerIndirectAccessTile(mlir::MLIRContext* context,
+                                   const AttrMapping& mem_space_map)
+      : OpRewritePattern(context), mem_space_map_(mem_space_map) {}
+
+  auto matchAndRewrite(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
+                       mlir::PatternRewriter& rewriter) const
+      -> llvm::LogicalResult override {
+    const auto base = llvm::cast<MemRef>(op.getBase());
+    const auto iab = llvm::cast<MemRef>(op.getIndAddrBufMemref());
+
+    const bool lower_base =
+        !base.getDefiningOp<mlir::memref::ReinterpretCastOp>();
+    const auto iab_space = mem_space_map_.map(getMemorySpace(iab));
+    const bool lower_iab = iab_space != iab.getType().getMemorySpace();
+    if (!lower_base && !lower_iab) {
+      return rewriter.notifyMatchFailure(op, "already bufferized");
+    }
+
+    llvm::SmallVector<int64_t> strides = getMemoryViewStrides(base);
+    if (lower_base && llvm::any_of(strides, mlir::ShapedType::isDynamic)) {
+      return rewriter.notifyMatchFailure(op, "dynamic base strides");
+    }
+
+    mlir::Value new_base = base;
+    if (lower_base) {
+      const auto base_type = base.getType();
+      const auto memory_space = mem_space_map_.map(getMemorySpace(base));
+      const auto cast_source_type = mlir::MemRefType::get(
+          base_type.getShape(), base_type.getElementType(),
+          base_type.getLayout(), memory_space);
+      auto memory_space_cast = mlir::memref::MemorySpaceCastOp::create(
+          rewriter, op.getLoc(), cast_source_type, base);
+
+      const auto result_type = mlir::MemRefType::get(
+          base_type.getShape(), base_type.getElementType(),
+          mlir::StridedLayoutAttr::get(rewriter.getContext(),
+                                       mlir::ShapedType::kDynamic, strides),
+          memory_space);
+      mlir::OpFoldResult offset(
+          mlir::arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0));
+      new_base = mlir::memref::ReinterpretCastOp::create(
+          rewriter, op.getLoc(), result_type, memory_space_cast.getResult(),
+          offset,
+          mlir::getAsIndexOpFoldResult(rewriter.getContext(),
+                                       base_type.getShape()),
+          mlir::getAsIndexOpFoldResult(rewriter.getContext(), strides));
+    }
+
+    mlir::Value new_iab = iab;
+    if (lower_iab) {
+      const auto iab_type = iab.getType();
+      new_iab = mlir::memref::MemorySpaceCastOp::create(
+          rewriter, op.getLoc(),
+          mlir::MemRefType::get(iab_type.getShape(), iab_type.getElementType(),
+                                iab_type.getLayout(), iab_space),
+          iab);
+    }
+
+    rewriter.modifyOpInPlace(op, [&] {
+      op.getBaseMutable().assign(new_base);
+      op.getIndAddrBufMemrefMutable().assign(new_iab);
+    });
+    return llvm::success();
+  }
+
+ private:
+  AttrMapping mem_space_map_;
+};
+
 }  // namespace
 
 void KTIRBufferizePass::runOnOperation() {
@@ -271,7 +365,8 @@ void KTIRBufferizePass::runOnOperation() {
   }
 
   mlir::RewritePatternSet patterns(&getContext());
-  patterns.add<LowerAccessTile>(patterns.getContext(), mem_space_map);
+  patterns.add<LowerAccessTile, LowerIndirectAccessTile>(patterns.getContext(),
+                                                         mem_space_map);
 
   if (failed(mlir::applyPatternsGreedily(func, std::move(patterns)))) {
     signalPassFailure();

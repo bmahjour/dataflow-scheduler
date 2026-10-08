@@ -73,6 +73,10 @@ def KTIRBufferizePass : Pass<"ktir-bufferize", "mlir::func::FuncOp"> {
 
     The following ops are bufferized by this pass:
       - `ktdp.(load|store)`
+      - `ktdp_lowering.construct_indirect_access_tile`: its base memory view
+        is cast to the mapped memory space and reinterpreted over its full
+        shape, and its indirect address buffer is cast if its memory space
+        is remapped. The access tile itself is kept.
   }];
   let dependentDialects = [
     "mlir::arith::ArithDialect",
