@@ -72,7 +72,12 @@ def KTIRBufferizePass : Pass<"ktir-bufferize", "mlir::func::FuncOp"> {
     with actual backing memory and `memref`s where needed.
 
     The following ops are bufferized by this pass:
-      - `ktdp.(load|store)`
+      - `ktdp.(load|store)` on direct tiles -> `ktdp_lowering.(load|store)`
+      - `ktdp.construct_access_tile` -> `memory_space_cast` + `reinterpret_cast`
+      - `ktdp.(load|store)` and `ktdp_lowering.(load|store)` on indirect tiles
+        (whose access tile is `ktdp_lowering.construct_indirect_access_tile`)
+        -> `ktdp_lowering.(ind_load|ind_store)`; the IAB memref is
+        `reinterpret_cast`-only (no `memory_space_cast`).
   }];
   let dependentDialects = [
     "mlir::arith::ArithDialect",
