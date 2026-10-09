@@ -54,6 +54,10 @@ def KTIRMapAndTilePass : Pass<"ktir-map-and-tile", "mlir::func::FuncOp"> {
     Performs device-specific mapping and tiling transformations on a normalized
     KTIR input program, leading to parallel loop nests with their load/store
     operations having been sunk/hoisted.
+
+    Compute operations that are already nested in loops (e.g. after
+    `IndirectAccessLoopMaterialization`) are mapped to a compute resource and
+    throttled, but not tiled.
   }];
   let dependentDialects = [
     "mlir::ktdf::KTDFDialect",
