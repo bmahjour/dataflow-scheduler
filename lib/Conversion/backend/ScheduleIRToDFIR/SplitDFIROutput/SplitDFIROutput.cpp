@@ -107,7 +107,9 @@ struct SplitDFIROutputPass
               mlir::dyn_cast<mlir::FileLineColLoc>(top_module.getLoc())) {
         llvm::StringRef parent =
             llvm::sys::path::parent_path(file_loc.getFilename().getValue());
-        out_dir.assign(parent);
+        // A bare file name (e.g. "gather.ktir") has no parent; use the
+        // current directory.
+        out_dir.assign(parent.empty() ? llvm::StringRef(".") : parent);
       } else {
         top_module.emitError()
             << "output-dir not specified and source location unavailable";

@@ -40,6 +40,8 @@
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
+#include <limits>
+
 #include "Utils.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
@@ -192,6 +194,58 @@ namespace {
       .getResult();
 }
 
+/// The throttle of a store that fills an indirect address buffer: entries are
+/// written one at a time.
+constexpr int64_t kIndAddrBufFillThrottle = 1;
+
+/// Determines whether @p access_tile is over an indirect address buffer, i.e.
+/// over a `ktdp_lowering.construct_memory_view` (which carries the arch-graph
+/// memory space of such a buffer).
+[[nodiscard]] bool isIndAddrBufTile(mlir::Value access_tile) {
+  auto tile = access_tile.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>();
+  return tile &&
+         tile.getBase()
+             .getDefiningOp<mlir::ktdp_lowering::ConstructMemoryViewOp>();
+}
+
+/// Gets the minimum throttle of the ops consuming @p value , looking through
+/// `tensor.(collapse|expand)_shape`.
+[[nodiscard]] int64_t getConsumerThrottle(mlir::Value value) {
+  auto result = std::numeric_limits<int64_t>::max();
+  for (auto* user : value.getUsers()) {
+    result = std::min(
+        result,
+        mlir::isa<mlir::tensor::CollapseShapeOp, mlir::tensor::ExpandShapeOp>(
+            user)
+            ? getConsumerThrottle(user->getResult(0))
+            : getThrottle(user));
+  }
+  return result;
+}
+
+/// Gets the throttle of the op producing @p value , looking through
+/// `tensor.(collapse|expand)_shape`.
+[[nodiscard]] int64_t getProducerThrottle(mlir::Value value) {
+  while (auto* op = value.getDefiningOp()) {
+    if (!mlir::isa<mlir::tensor::CollapseShapeOp, mlir::tensor::ExpandShapeOp>(
+            op))
+      return getThrottle(op);
+    value = op->getOperand(0);
+  }
+  return std::numeric_limits<int64_t>::max();
+}
+
+/// Copies the discardable attributes of @p from onto @p to . If that leaves
+/// @p to without a throttle, uses @p fallback , unless it is unknown.
+void copyAttrsAndThrottle(mlir::Operation* from, mlir::Operation* to,
+                          int64_t fallback) {
+  to->setDiscardableAttrs(from->getRawDictionaryAttrs());
+  if (!to->hasAttr(kThrottleAttrName) &&
+      fallback != std::numeric_limits<int64_t>::max()) {
+    setThrottle(to, fallback);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // LowerLoad  (ktdp.load -> ktdp_lowering.load, skips indirect tiles)
 // ---------------------------------------------------------------------------
@@ -216,6 +270,8 @@ struct LowerLoad : mlir::OpRewritePattern<mlir::ktdp::LoadOp> {
     auto new_load = mlir::ktdp_lowering::LoadOp::create(
         rewriter, load.getLoc(), result_type, load.getAccessTile(), {}, {}, {},
         static_offsets, result_type.getShape(), static_strides);
+    // Like a tiled load, transfer at the rate of the consuming computes.
+    copyAttrsAndThrottle(load, new_load, getConsumerThrottle(load.getResult()));
     rewriter.replaceOp(load, new_load);
     return llvm::success();
   }
@@ -242,9 +298,14 @@ struct LowerStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
 
     llvm::SmallVector<int64_t> static_offsets(data_type.getRank(), 0);
     llvm::SmallVector<int64_t> static_strides(data_type.getRank(), 1);
-    mlir::ktdp_lowering::StoreOp::create(
+    auto new_store = mlir::ktdp_lowering::StoreOp::create(
         rewriter, store.getLoc(), store.getDataTile(), store.getAccessTile(),
         {}, {}, {}, static_offsets, data_type.getShape(), static_strides);
+    // Like a tiled store, transfer at the rate of the producing compute.
+    copyAttrsAndThrottle(store, new_store,
+                         isIndAddrBufTile(store.getAccessTile())
+                             ? kIndAddrBufFillThrottle
+                             : getProducerThrottle(store.getDataTile()));
     rewriter.eraseOp(store);
     return llvm::success();
   }
@@ -642,6 +703,12 @@ struct IndirectOpInfo {
     }
   }
 
+  // Fold constant offsets (e.g. a captured `arith.constant`) into static ones.
+  for (auto& offset : info.offsets) {
+    if (auto value = llvm::dyn_cast<mlir::Value>(offset))
+      offset = mlir::getAsOpFoldResult(value);
+  }
+
   info.tensor_type = tensor_type;
   return true;
 }
@@ -739,6 +806,9 @@ struct LowerIndirectLoad : mlir::OpRewritePattern<LoadOpT> {
     auto ind_load = mlir::ktdp_lowering::IndLoadOp::create(
         rewriter, loc, result_type, iab_view, info.iab_index, base_view,
         info.offsets, info.sizes, info.strides);
+    // Like a direct load, transfer at the rate of the consuming computes.
+    copyAttrsAndThrottle(load, ind_load,
+                         getConsumerThrottle(load->getResult(0)));
 
     rewriter.replaceOp(load, ind_load.getResult());
 
@@ -819,9 +889,11 @@ struct LowerIndirectStore : mlir::OpRewritePattern<StoreOpT> {
         buildIABView(rewriter, loc, tile_op.getIndAddrBufMemref());
 
     // Create ind_store.
-    mlir::ktdp_lowering::IndStoreOp::create(
+    auto ind_store = mlir::ktdp_lowering::IndStoreOp::create(
         rewriter, loc, source_val, iab_view, info.iab_index, base_view,
         info.offsets, info.sizes, info.strides);
+    // Like a direct store, transfer at the rate of the producing compute.
+    copyAttrsAndThrottle(store, ind_store, getProducerThrottle(source_val));
 
     rewriter.eraseOp(store);
 
