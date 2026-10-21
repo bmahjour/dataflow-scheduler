@@ -160,8 +160,13 @@ void PathExpansionMaterializer::createDataTransfer(
   auto transfer = mlir::ktdf::DataTransferOp::create(
       builder_, loc, source.value, source_map, source.indices, source.sizes,
       dest.value, dest_map, dest.indices, dest.sizes);
-  if (template_op)
+  if (template_op) {
     transfer->setDiscardableAttrs(template_op->getRawDictionaryAttrs());
+    if (auto template_transfer =
+            mlir::dyn_cast<mlir::ktdf::DataTransferOp>(template_op)) {
+      transfer.setTransferMode(template_transfer.getTransferMode());
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
