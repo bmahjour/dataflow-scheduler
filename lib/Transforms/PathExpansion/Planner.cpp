@@ -32,6 +32,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -257,39 +258,109 @@ static ResourceType memrefMemorySpace(mlir::Value val) {
   return nullptr;
 }
 
-/// Return the {source, dest} memref memory-spaces from the first
-/// data_transfer op in stage_op.  Either element may be nullptr if that side
-/// is not a memref (e.g. a FIFO).  Both are found in a single walk.
+namespace {
+/// What all the data transfers of a stage have in common at one end, either
+/// the end they read from or the end they write to.
+struct SharedEnd {
+  /// The memory that every transfer uses at this end, if they all use a
+  /// memref in the same memory. Null otherwise.
+  ResourceType memory;
+  /// The load/store unit that every transfer uses at this end, if they all
+  /// use a FIFO that names the same load/store unit on this stage's side.
+  /// That is the FIFO's source when the stage writes into the FIFO, and the
+  /// FIFO's destination when the stage reads from it. Null otherwise.
+  ResourceType unit;
+  /// True if every transfer uses a memref at this end, not a FIFO.
+  bool all_memref = false;
+};
+
+/// What the data transfers of one stage have in common.
+struct TransferEnds {
+  /// Number of data transfers in the stage.
+  size_t num_transfers = 0;
+  /// The end that the transfers read from.
+  SharedEnd source;
+  /// The end that the transfers write to.
+  SharedEnd dest;
+};
+}  // namespace
+
+/// Find what the data transfers in \p stage_op have in common at the end they
+/// read from and at the end they write to. See TransferEnds.
 ///
-/// For stages containing an IndDataTransferOp, that op takes priority:
-/// - Gather (ind_src present): returns (dir_src memory-space, nullptr).
-/// - Scatter (ind_dst present): returns (nullptr, dir_dst memory-space).
-/// This ensures the IAB-fill DataTransferOp does not
-/// pollute the result with its "IAB" destination memory-space.
-static std::pair<ResourceType, ResourceType> firstTransferMemSpaces(
-    mlir::ktdf::StageOp stage_op) {
-  // Check for IndDataTransferOp first — it takes priority over any co-located
-  // DataTransferOp (e.g. the IBR fill inside scf.if in scatter stages).
-  mlir::ktdf::IndDataTransferOp ind_transfer;
+/// A FIFO only counts when its type names a load/store unit at the stage's
+/// end. Input FIFOs often name a memory there instead, such as "DDR" in
+/// "DDR -> SFU". That name is only a placeholder, which path expansion
+/// replaces later, so it is not trusted to tell where the stage runs.
+///
+/// If the stage has indirect transfers, only those are looked at. The plain
+/// transfer that fills the IAB next to them would otherwise add its "IAB"
+/// destination. For an indirect transfer only the data operands count, not
+/// the address operands.
+static TransferEnds collectTransferEnds(
+    mlir::ktdf::StageOp stage_op,
+    const scheduler::arch_view::RoutingGraph& arch_graph) {
+  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
+
+  // The source and destination operands of every transfer.
+  llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> operands;
   stage_op.walk([&](mlir::ktdf::IndDataTransferOp op) {
-    ind_transfer = op;
-    return mlir::WalkResult::interrupt();
+    operands.push_back({op.getDirSrc(), op.getDirDst()});
   });
-  if (ind_transfer) {
-    if (ind_transfer.isGather())
-      return {memrefMemorySpace(ind_transfer.getDirSrc()), nullptr};
-    // scatter
-    return {nullptr, memrefMemorySpace(ind_transfer.getDirDst())};
+  if (operands.empty()) {
+    stage_op.walk([&](mlir::ktdf::DataTransferOp op) {
+      operands.push_back({op.getSource(), op.getDestination()});
+    });
   }
 
-  ResourceType src, dst;
-  stage_op.walk([&](mlir::ktdf::DataTransferOp transfer_op) {
-    if (!src) src = memrefMemorySpace(transfer_op.getSource());
-    if (!dst) dst = memrefMemorySpace(transfer_op.getDestination());
-    return (src && dst) ? mlir::WalkResult::interrupt()
-                        : mlir::WalkResult::advance();
-  });
-  return {src, dst};
+  // The load/store unit that a FIFO operand names on this stage's side, or
+  // null. That is the FIFO's destination when the stage reads from it, and
+  // the FIFO's source when the stage writes into it.
+  auto unitOf = [&](mlir::Value val, bool stage_reads) -> ResourceType {
+    auto fifo = mlir::dyn_cast<mlir::ktdf::FifoSlotType>(val.getType());
+    if (!fifo) return nullptr;
+    auto end = llvm::dyn_cast<ResourceType>(stage_reads ? fifo.getDest()
+                                                        : fifo.getSrc());
+    if (!end) return nullptr;
+    // A device may have several copies of a unit, for example one per
+    // sub-core. They share a name, so every node with that name must be a
+    // load/store unit.
+    llvm::ArrayRef<scheduler::arch_view::RoutingGraph::NodeId> ids =
+        arch_graph.getNodeIdsForResource(end);
+    if (ids.empty() || llvm::any_of(ids, [&](auto id) {
+          return arch_graph.getNode(id)->kind != RK::LoadStoreUnit;
+        }))
+      return nullptr;
+    return end;
+  };
+
+  // Work out what every transfer has in common at one end. \p pick chooses
+  // the source or the destination operand, and \p stage_reads says whether
+  // the stage reads from that operand.
+  auto sharedEnd = [&](auto pick, bool stage_reads) {
+    SharedEnd shared;
+    mlir::Value first = pick(operands.front());
+    shared.memory = memrefMemorySpace(first);
+    shared.unit = unitOf(first, stage_reads);
+    shared.all_memref = true;
+    for (const auto& ops : operands) {
+      mlir::Value val = pick(ops);
+      if (memrefMemorySpace(val) != shared.memory) shared.memory = nullptr;
+      if (unitOf(val, stage_reads) != shared.unit) shared.unit = nullptr;
+      if (!mlir::isa<mlir::MemRefType>(val.getType()))
+        shared.all_memref = false;
+    }
+    return shared;
+  };
+
+  TransferEnds result;
+  result.num_transfers = operands.size();
+  if (operands.empty()) return result;
+  result.source = sharedEnd([](const auto& ops) { return ops.first; },
+                            /*stage_reads=*/true);
+  result.dest = sharedEnd([](const auto& ops) { return ops.second; },
+                          /*stage_reads=*/false);
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -426,24 +497,72 @@ static llvm::FailureOr<llvm::SmallVector<StageNode*>> sortAndValidateStages(
   return sorted_stages;
 }
 
-/// Work out the stage_resource of every original stage.
+/// Return the memory that a load/store unit works on: the memory it reads
+/// from for a load-side stage, or the memory it writes to for a store-side
+/// stage. Returns null unless there is exactly one such memory.
 ///
-/// The stage_resource is the memory a stage's load/store unit is attached to
-/// in the routing graph. Path expansion uses it to find out which memories
-/// and units the data passes through between stages.
+/// A device may have several copies of the unit, for example one per
+/// sub-core. All copies must work on the same memory.
+static ResourceType memoryOfUnit(
+    ResourceType unit, StageSide side,
+    const scheduler::arch_view::RoutingGraph& arch_graph) {
+  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
+  using NodeId = scheduler::arch_view::RoutingGraph::NodeId;
+
+  llvm::SmallSetVector<ResourceType, 2> memories;
+  auto consider = [&](NodeId node_id) {
+    auto node = arch_graph.getNode(node_id);
+    if (node && node->kind == RK::Memory) memories.insert(node->resource);
+  };
+  for (NodeId unit_id : arch_graph.getNodeIdsForResource(unit)) {
+    if (side == StageSide::kLoad) {
+      // Memories with a datapath into the unit.
+      for (NodeId node_id : arch_graph.getAllNodeIds())
+        if (llvm::is_contained(arch_graph.getNeighbors(node_id), unit_id))
+          consider(node_id);
+    } else {
+      // Memories the unit has a datapath into.
+      for (NodeId node_id : arch_graph.getNeighbors(unit_id)) consider(node_id);
+    }
+  }
+  return memories.size() == 1 ? memories.front() : nullptr;
+}
+
+/// Work out the stage_resource of every original stage, and for some stages
+/// also the unit they run on.
 ///
-/// Each stage is decided on its own, using the rules below in order:
+/// The stage_resource is the memory that a stage's load/store unit works on.
+/// Path expansion uses it to find which memories and units the data passes
+/// through between stages.
 ///
-///  1. The stage is already pinned to a unit in the input IR (a compute unit
-///     or a load/store unit). Its resource is that unit.
-///  2. Only one side of the stage's data transfer is a memref; the other side
-///     is a FIFO. The memref side is the stage's memory.
-///  3. Both sides are memrefs, so the side of the pipeline decides:
-///       - A load-side stage reads from the memory next to its load unit and
-///         pushes the data towards the compute stage, so its resource is the
-///         transfer's source.
-///       - A store-side stage writes to the memory next to its store unit,
-///         so its resource is the transfer's destination.
+/// A stage may have several data transfers. Either they all read from the
+/// same place, or they all write to the same place; the other ends may
+/// differ. A place is either a memory, for a memref, or a load/store unit
+/// named in a FIFO type. For example, a stage may copy DDR into two FIFOs,
+/// or write into two FIFOs of type "L0LU -> PT" and "L0LU -> SFU", which
+/// both start at L0LU.
+///
+/// Each stage is decided on its own. A stage pinned to a unit in the input IR
+/// uses that unit as its resource. For any other stage, two things are worked
+/// out separately:
+///
+///  - The memory. If all transfers read from one memory, or all write to one
+///    memory, that memory is the resource. If both are true, as in a single
+///    DDR -> L1 copy, the side of the pipeline decides: a load-side stage
+///    uses the memory it reads from, and a store-side stage the memory it
+///    writes to.
+///  - The unit. If all transfers use FIFOs that name the same load/store unit
+///    on this stage's side, the stage runs on that unit. The stage's side of
+///    a FIFO is the FIFO's source when the stage writes into it, and the
+///    FIFO's destination when the stage reads from it.
+///
+/// A stage may have a memory, a unit, or both. With only a unit, the resource
+/// is the memory that unit works on. With both, that memory must be the same
+/// as the one found from the memrefs. For example, a stage that reads an L1
+/// memref into FIFOs of type "L1LU -> SFU" has memory L1 and unit L1LU,
+/// which agree because L1LU reads from L1.
+///
+/// A stage that has neither a memory nor a unit is rejected.
 ///
 /// Because the side of a stage comes from \p sides, the rules never look at
 /// neighbouring stages. That is why the order of stages within a side does
@@ -452,8 +571,9 @@ static llvm::FailureOr<llvm::SmallVector<StageNode*>> sortAndValidateStages(
 /// A stage with no predecessors must read from memory, because nothing in the
 /// pipeline could fill a FIFO it reads from. Likewise, a stage with no
 /// successors must write to memory. Both are asserted.
-static void assignOriginalStageResources(
+static mlir::LogicalResult assignOriginalStageResources(
     llvm::ArrayRef<StageNode*> sorted_stages, const StageSideMap& sides,
+    const scheduler::arch_view::RoutingGraph& arch_graph,
     PathExpansionPlan* plan) {
   // Stages that some other stage feeds into.
   llvm::SmallPtrSet<StageNode*, 8> has_predecessor;
@@ -469,7 +589,7 @@ static void assignOriginalStageResources(
         mlir::dyn_cast_or_null<mlir::ktdf::StageOp>(stage->getOperation());
     assert(stage_op && "expected operation to be valid for original stages");
 
-    // Rule 1: the unit is already known from the input IR.
+    // A pinned stage: the unit is already known from the input IR.
     if (auto units = stage_op.getApplicableUnits()) {
       assert(units->size() == 1 &&
              "path expansion currently does not handle nested pipelines with "
@@ -478,30 +598,59 @@ static void assignOriginalStageResources(
       continue;
     }
 
-    auto [src_ms, dst_ms] = firstTransferMemSpaces(stage_op);
-    assert((src_ms || dst_ms) &&
-           "Unable to determine stage_resource for original stage: its data "
-           "transfer has no memref side");
-    assert((has_predecessor.contains(stage) || src_ms) &&
-           "A stage with no predecessors must have a memref source on its "
+    TransferEnds ends = collectTransferEnds(stage_op, arch_graph);
+    assert(ends.num_transfers > 0 &&
+           "Unable to determine stage_resource for original stage: it has no "
+           "data transfer");
+    assert((has_predecessor.contains(stage) || ends.source.all_memref) &&
+           "A stage with no predecessors must have a memref source on every "
            "data_transfer");
-    assert((!stage->getDependencies().empty() || dst_ms) &&
-           "A stage with no successors must have a memref dest on its "
+    assert((!stage->getDependencies().empty() || ends.dest.all_memref) &&
+           "A stage with no successors must have a memref dest on every "
            "data_transfer");
 
-    // Rule 2: only one side of the transfer is a memref.
-    if (!src_ms || !dst_ms) {
-      info.stage_resource = src_ms ? src_ms : dst_ms;
-      continue;
-    }
-
-    // Rule 3: both sides are memrefs; the side of the pipeline decides.
     // Compute stages are always pinned, so they were handled by rule 1.
     StageSide side = sides.at(stage);
     assert(side != StageSide::kCompute &&
            "Compute stages should be pinned to a unit");
-    info.stage_resource = side == StageSide::kLoad ? src_ms : dst_ms;
+
+    // The memory shared by all transfers, if any.
+    ResourceType memory;
+    if (ends.source.memory && ends.dest.memory)
+      memory = side == StageSide::kLoad ? ends.source.memory : ends.dest.memory;
+    else
+      memory = ends.source.memory ? ends.source.memory : ends.dest.memory;
+
+    // The load/store unit shared by all transfers, if any.
+    ResourceType unit = ends.source.unit ? ends.source.unit : ends.dest.unit;
+    if (ends.source.unit && ends.dest.unit &&
+        ends.source.unit != ends.dest.unit)
+      return stage_op.emitError(
+                 "path-expansion: the stage's FIFOs place it "
+                 "on two different units, ")
+             << ends.source.unit << " and " << ends.dest.unit;
+
+    if (!memory && !unit)
+      return stage_op.emitError(
+          "path-expansion: the data transfers of a stage must all read from "
+          "the same place or all write to the same place");
+
+    if (unit) {
+      ResourceType unit_memory = memoryOfUnit(unit, side, arch_graph);
+      if (!unit_memory)
+        return stage_op.emitError(
+                   "path-expansion: cannot tell which memory unit ")
+               << unit << " works on for this stage";
+      if (memory && memory != unit_memory)
+        return stage_op.emitError("path-expansion: the stage uses memory ")
+               << memory << ", but its FIFOs place it on unit " << unit
+               << ", which works on " << unit_memory;
+      memory = unit_memory;
+      info.applicable_unit = unit;
+    }
+    info.stage_resource = memory;
   }
+  return mlir::success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -1804,7 +1953,10 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
   LLVM_DEBUG(debugPrintInitialPlannerState(pipeline, sorted_stages));
 
   // PREP 2: Assign resources
-  assignOriginalStageResources(sorted_stages, sides, plan.get());
+  if (mlir::failed(assignOriginalStageResources(sorted_stages, sides,
+                                                arch_graph, plan.get()))) {
+    return nullptr;
+  }
 
   // PREP 3: Find the routing path for every dependency between stages
   llvm::FailureOr<llvm::SmallVector<EdgeSegment>> segments_or =
