@@ -257,7 +257,8 @@ static void collectBlockArgDependencies(Value val, IRMapping& mapper,
 //===----------------------------------------------------------------------===//
 
 /// Builds the ktdp.construct_memory_view spanning the whole address buffer,
-/// which lives in global memory at the byte address @p base_offset holds.
+/// which lives in global memory at the offset, in entries, @p base_offset
+/// holds.
 ///
 /// Nothing is threaded between the two halves of the split but that address, so
 /// each rebuilds this view for itself.  Both model it on @p idx_view: the
@@ -336,8 +337,9 @@ struct AddressBufferInfo {
   /// carries the indirect_address_buffer feature.  Used as the memref
   /// memory_space attribute for the IAB view.
   StringAttr iab_mem_space;
-  /// First address in the IAB available to the scheduler, i.e. past any bytes
-  /// the arch spec reserves.  The IAB view starts here.
+  /// First IAB entry available to the scheduler, i.e. the first one past any
+  /// bytes the arch spec reserves.  The IAB view starts here.  Counted in
+  /// entries, as a memory view's offset is.
   size_t iab_base;
 };
 
@@ -504,11 +506,15 @@ static FailureOr<AddressBufferInfo> resolveAddressBufferInfo(
   LDBG(1) << "IAB entry type " << entry_type << ", address arithmetic in "
           << compute_type;
 
+  // The arch spec reserves bytes, but a view's offset counts entries; a
+  // partially reserved entry is unusable, so round up.
   StringAttr iab_mem_space = cast<StringAttr>(iab_node->memory_resource);
+  const size_t iab_base =
+      llvm::divideCeil(iab_node->reserved_in_bytes.value_or(0),
+                       *tryGetSizeInBytes(compute_type));
   return AddressBufferInfo{entry_type, compute_type,
                            memory_tree.getRootOf(*iab_node).memory_resource,
-                           iab_mem_space,
-                           iab_node->reserved_in_bytes.value_or(0)};
+                           iab_mem_space, iab_base};
 }
 
 /// Locates the orchestrator module, its function and every call that function
@@ -782,7 +788,8 @@ static FailureOr<SplitCandidate> analyzeCandidate(
 ///     (constants, arith ops, ...) in wholesale
 ///   - loads the raw integer indices through the resulting clone of @p idx_view
 ///   - turns them into flat absolute addresses with spyreop.idx32toaddr
-///   - stores those addresses into the address buffer at @p addr_buf_base
+///   - stores those addresses into the address buffer at @p addr_buf_base,
+///     an offset in entries into global memory
 ///
 /// Returns the function's final symbol name, which the caller must hand to
 /// updateOrchestrator() so the call site names the same symbol.
@@ -959,9 +966,9 @@ static std::string buildIdxToAddrModule(
 ///     folded into every address by @<name>_idx_to_addr
 ///   - replace @p indirect_op with ktdp_lowering.construct_indirect_access_tile
 ///
-/// @p addr_buf_base is the address buffer's byte address in global memory, and
-/// @p iab_base the IAB's first available address; the two live in different
-/// memories, so they are independent.
+/// @p addr_buf_base is the address buffer's offset in global memory, and
+/// @p iab_base the IAB's first available entry; both count entries, but they
+/// live in different memories, so they are independent.
 ///
 /// @p ind_addr_buf_dim_positions comes from deriveIndAddrBufDimPositions();
 /// deriving it up front is what leaves this step no failure path.
@@ -1206,7 +1213,14 @@ static LogicalResult splitCandidate(const SplitCandidate& candidate,
            << reason;
   }
   LDBG(1) << "allocated " << size_bytes << " bytes for @" << func.getName()
-          << "'s address buffer at " << *addr_buf_base;
+          << "'s address buffer at byte " << *addr_buf_base;
+
+  // The tracker hands out byte addresses, but the address buffer's views take
+  // their offset in entries.  The allocation was aligned to an entry, so this
+  // divides exactly.
+  assert(*addr_buf_base % entry_bytes == 0 &&
+         "address buffer must be entry-aligned");
+  const size_t addr_buf_offset = *addr_buf_base / entry_bytes;
 
   // Extract or materialize the stride. candidate.stride may be either a Value
   // (already computed at runtime) or an Attribute (compile-time constant).
@@ -1227,13 +1241,13 @@ static LogicalResult splitCandidate(const SplitCandidate& candidate,
 
   std::string idx_to_addr_func_name = buildIdxToAddrModule(
       candidate.module, top_sym_table, candidate.idx_view, candidate.base_addr,
-      stride, candidate.forwarded_args, *addr_buf_base, addr_info.compute_type);
+      stride, candidate.forwarded_args, addr_buf_offset,
+      addr_info.compute_type);
 
-  rewriteGatherScatterModule(candidate.indirect_op, candidate.idx_view,
-                             *addr_buf_base, candidate.indir_dim,
-                             addr_info.compute_type, addr_info.iab_mem_space,
-                             addr_info.iab_base,
-                             candidate.ind_addr_buf_dim_positions);
+  rewriteGatherScatterModule(
+      candidate.indirect_op, candidate.idx_view, addr_buf_offset,
+      candidate.indir_dim, addr_info.compute_type, addr_info.iab_mem_space,
+      addr_info.iab_base, candidate.ind_addr_buf_dim_positions);
 
   if (candidate.call_site)
     updateOrchestrator(*orchestrator.symbol_table, candidate.call_site, func,

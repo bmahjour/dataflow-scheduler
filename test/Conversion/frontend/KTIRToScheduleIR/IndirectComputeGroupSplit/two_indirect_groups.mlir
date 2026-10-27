@@ -5,7 +5,7 @@
 // top-level symbol table (each idx_to_addr module must get its own name), the
 // orchestrator's symbol table (each needs its own forward declaration), the
 // orchestrator call-site map, and the memory tracker (each address buffer must
-// get its own address — 2x32 i32 entries = 256 bytes apart).
+// get its own address — 2x32 i32 entries = 64 entries, or 256 bytes, apart).
 //
 // RUN: dataflow-scheduler-opt --indirect-compute-group-split %s | FileCheck %s
 
@@ -20,14 +20,14 @@
 // CHECK:       func.func private @local_schedule_1_idx_to_addr()
 
 // Each group gets its own address buffer: the first at offset 0, the second one
-// 2*32*4 = 256 bytes further along.
+// 2*32 = 64 entries (256 bytes) further along.  View offsets count entries.
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         %[[BUF0:.*]] = arith.constant 0 : index
 // CHECK:         ktdp.construct_memory_view %[[BUF0]], sizes: [2, 32]
 // CHECK-SAME:      memref<2x32xi32
 
 // CHECK-LABEL: module @local_schedule_1_idx_to_addr
-// CHECK:         %[[BUF1:.*]] = arith.constant 256 : index
+// CHECK:         %[[BUF1:.*]] = arith.constant 64 : index
 // CHECK:         ktdp.construct_memory_view %[[BUF1]], sizes: [2, 32]
 // CHECK-SAME:      memref<2x32xi32
 
