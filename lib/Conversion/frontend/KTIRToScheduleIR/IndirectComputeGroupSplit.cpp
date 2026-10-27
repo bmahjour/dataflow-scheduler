@@ -336,6 +336,9 @@ struct AddressBufferInfo {
   /// carries the indirect_address_buffer feature.  Used as the memref
   /// memory_space attribute for the IAB view.
   StringAttr iab_mem_space;
+  /// First address in the IAB available to the scheduler, i.e. past any bytes
+  /// the arch spec reserves.  The IAB view starts here.
+  size_t iab_base;
 };
 
 /// The orchestrator-side state every candidate needs, likewise resolved once.
@@ -504,7 +507,8 @@ static FailureOr<AddressBufferInfo> resolveAddressBufferInfo(
   StringAttr iab_mem_space = cast<StringAttr>(iab_node->memory_resource);
   return AddressBufferInfo{entry_type, compute_type,
                            memory_tree.getRootOf(*iab_node).memory_resource,
-                           iab_mem_space};
+                           iab_mem_space,
+                           iab_node->reserved_in_bytes.value_or(0)};
 }
 
 /// Locates the orchestrator module, its function and every call that function
@@ -955,13 +959,17 @@ static std::string buildIdxToAddrModule(
 ///     folded into every address by @<name>_idx_to_addr
 ///   - replace @p indirect_op with ktdp_lowering.construct_indirect_access_tile
 ///
+/// @p addr_buf_base is the address buffer's byte address in global memory, and
+/// @p iab_base the IAB's first available address; the two live in different
+/// memories, so they are independent.
+///
 /// @p ind_addr_buf_dim_positions comes from deriveIndAddrBufDimPositions();
 /// deriving it up front is what leaves this step no failure path.
 static void rewriteGatherScatterModule(
     ktdp::ConstructIndirectAccessTilesOp indirect_op,
     ktdp::ConstructMemoryViewOp idx_view, size_t addr_buf_base,
     unsigned indir_dim, Type compute_type, StringAttr iab_mem_space,
-    DenseI32ArrayAttr ind_addr_buf_dim_positions) {
+    size_t iab_base, DenseI32ArrayAttr ind_addr_buf_dim_positions) {
   auto func = indirect_op->getParentOfType<func::FuncOp>();
   assert(func && "indirect_op must be enclosed in a FuncOp");
   MLIRContext* ctx = func.getContext();
@@ -983,6 +991,8 @@ static void rewriteGatherScatterModule(
   OpBuilder builder(indirect_op);
   Value addr_buf_base_const = arith::ConstantIndexOp::create(
       builder, loc, static_cast<int64_t>(addr_buf_base));
+  Value iab_base_const = arith::ConstantIndexOp::create(
+      builder, loc, static_cast<int64_t>(iab_base));
 
   // The IAB view over the address buffer.  This uses
   // ktdp_lowering.construct_memory_view rather than the ktdp one because "IAB"
@@ -993,7 +1003,7 @@ static void rewriteGatherScatterModule(
       builder, loc,
       /*resultType=*/
       MemRefType::get(idx_shape, compute_type, nullptr, iab_mem_space),
-      /*offset=*/addr_buf_base_const,
+      /*offset=*/iab_base_const,
       /*sizes=*/ValueRange{},
       /*strides=*/ValueRange{},
       /*static_sizes=*/idx_view.getStaticSizes(),
@@ -1222,6 +1232,7 @@ static LogicalResult splitCandidate(const SplitCandidate& candidate,
   rewriteGatherScatterModule(candidate.indirect_op, candidate.idx_view,
                              *addr_buf_base, candidate.indir_dim,
                              addr_info.compute_type, addr_info.iab_mem_space,
+                             addr_info.iab_base,
                              candidate.ind_addr_buf_dim_positions);
 
   if (candidate.call_site)
