@@ -53,9 +53,11 @@
 // CHECK-LABEL: module @local_schedule_0
 // CHECK:         func.func @local_schedule_0
 // CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[ABUFC0:.*]] = arith.constant 0 : index
 // CHECK:           %[[IABC0:.*]] = arith.constant 0 : index
 // CHECK:           %[[IAB:.*]] = ktdp_lowering.construct_memory_view %[[IABC0]], sizes: [2, 32], strides: [32, 1]
 // CHECK-SAME:        "IAB"
+// CHECK:           ktdp.construct_memory_view %[[ABUFC0]], sizes: [2, 32], strides: [32, 1]
 // CHECK:           %[[DATAC0:.*]] = arith.constant 0 : index
 // CHECK:           %[[DATA:.*]] = ktdp.construct_memory_view %[[DATAC0]], sizes: [64, 2, 64]
 // CHECK:           ktdp_lowering.construct_indirect_access_tile
