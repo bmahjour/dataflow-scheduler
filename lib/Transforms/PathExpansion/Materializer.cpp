@@ -127,6 +127,8 @@ mlir::OpFoldResult PathExpansionMaterializer::materializeOpFoldResult(
 
 mlir::Value PathExpansionMaterializer::getPrivateResourceValue(
     const PrivateResourceSpec* spec, size_t slot_index) {
+  if (spec->kind == PrivateResourceSpec::Kind::kExistingValue)
+    return materializeValue(spec->existing_value);
   const PrivateResourceAllocation* alloc =
       resource_factory_.getAllocation(spec);
   assert(alloc && "Private resource should have been allocated");

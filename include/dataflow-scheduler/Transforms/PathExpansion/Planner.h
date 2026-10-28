@@ -62,14 +62,18 @@ struct PrivateResourceAllocation;
 struct PrivateResourceSpec {
   enum class Kind {
     kUnknown,
-    kMemoryBuffer,  // Allocate a memref in the specified memory space
-    kFifo,          // Allocate a FIFO with the specified type
+    kMemoryBuffer,   // Allocate a memref in the specified memory space
+    kFifo,           // Allocate a FIFO with the specified type
+    kExistingValue,  // Use a value of the original IR, allocate nothing
   };
 
   Kind kind = Kind::kUnknown;
 
-  // For Memory Buffer:
+  // For Memory Buffer and Existing Value:
   ResourceType memory_resource;
+
+  // For Existing Value: the original value, mapped through the materializer.
+  mlir::Value existing_value;
 
   // For Fifo:
   mlir::Attribute fifo_src;

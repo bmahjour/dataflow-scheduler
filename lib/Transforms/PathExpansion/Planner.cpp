@@ -21,6 +21,7 @@
 #include <llvm/Support/ErrorHandling.h>
 
 #include <tuple>
+#include <vector>
 
 #include "dataflow-scheduler/Analysis/ArchViews/RoutingGraph.h"
 #include "dataflow-scheduler/Analysis/PipelineTree.h"
@@ -145,6 +146,10 @@ void PrivateResourceSpec::print(llvm::raw_ostream& os) const {
       llvm::interleave(
           elements_per_slot, os, [&](int64_t e) { os << e; }, ", ");
       os << "], element_type=" << element_type << ")";
+      break;
+    case Kind::kExistingValue:
+      os << "ExistingValue(resource=" << memory_resource
+         << ", type=" << existing_value.getType() << ")";
       break;
     case Kind::kUnknown:
       os << "Unknown";
@@ -654,20 +659,126 @@ static mlir::LogicalResult assignOriginalStageResources(
 }
 
 //===----------------------------------------------------------------------===//
-// Routing Paths Between Stages
+// Data Flows Between Stages
 //===----------------------------------------------------------------------===//
 
 namespace {
-/// The routing-graph path for one dependency between two original stages.
+/// One end (producer or consumer) of a FIFO slot inside an original stage.
+struct FifoEndpoint {
+  mlir::Operation* op = nullptr;
+  StageNode* stage = nullptr;
+  // Whether the FIFO slot is the op's source operand (always true for
+  // read_from_fifo, always false for write_to_fifo).
+  bool fifo_is_source = false;
+};
+
+/// The producer and consumer of every FIFO slot used by the original stages.
+struct FifoEndpoints {
+  llvm::MapVector<mlir::Value, FifoEndpoint> producers;
+  llvm::MapVector<mlir::Value, FifoEndpoint> consumers;
+  // FIFO slots used by an indirect data transfer.
+  llvm::SmallPtrSet<mlir::Value, 4> indirect_slots;
+  // The first op found to be a second producer or consumer of a FIFO slot,
+  // and whether it is a producer. Path expansion cannot handle such a slot.
+  std::optional<std::pair<mlir::Operation*, bool>> duplicate;
+};
+}  // namespace
+
+/// Find the op that writes and the op that reads each FIFO slot used by the
+/// original stages. Only the first writer and the first reader of a slot are
+/// kept. A slot with more than one is noted in FifoEndpoints::duplicate,
+/// which is only an error if the pipeline needs expanding.
+static FifoEndpoints collectFifoEndpoints(llvm::ArrayRef<StageNode*> stages) {
+  FifoEndpoints endpoints;
+  for (StageNode* stage : stages) {
+    if (isIntermediateStage(stage)) continue;
+    auto stage_op = mlir::cast<mlir::ktdf::StageOp>(stage->getOperation());
+
+    auto record = [&](llvm::MapVector<mlir::Value, FifoEndpoint>& ends,
+                      mlir::Value fifo_slot, mlir::Operation* op,
+                      bool fifo_is_source) {
+      if (!ends.insert({fifo_slot, {op, stage, fifo_is_source}}).second &&
+          !endpoints.duplicate)
+        endpoints.duplicate = {op, &ends == &endpoints.producers};
+    };
+
+    stage_op.walk([&](mlir::Operation* op) {
+      if (auto read_op = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op))
+        return record(endpoints.consumers, read_op.getFifoSlot(), op, true);
+      if (auto write_op = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op))
+        return record(endpoints.producers, write_op.getFifoSlot(), op, false);
+      if (auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
+        if (mlir::isa<mlir::ktdf::FifoSlotType>(transfer.getSource().getType()))
+          record(endpoints.consumers, transfer.getSource(), op, true);
+        if (mlir::isa<mlir::ktdf::FifoSlotType>(
+                transfer.getDestination().getType()))
+          record(endpoints.producers, transfer.getDestination(), op, false);
+        return;
+      }
+      if (auto ind_transfer =
+              mlir::dyn_cast<mlir::ktdf::IndDataTransferOp>(op)) {
+        bool is_gather = ind_transfer.isGather();
+        mlir::Value fifo_side =
+            is_gather ? ind_transfer.getDirDst() : ind_transfer.getDirSrc();
+        if (!mlir::isa<mlir::ktdf::FifoSlotType>(fifo_side.getType())) return;
+        endpoints.indirect_slots.insert(fifo_side);
+        if (is_gather)
+          record(endpoints.producers, fifo_side, op, false);
+        else
+          record(endpoints.consumers, fifo_side, op, true);
+      }
+    });
+  }
+  return endpoints;
+}
+
+/// Return the fifo.allocate result that \p fifo_slot (a ktdf.private result)
+/// is yielded from, or a null result if it cannot be traced.
+static mlir::OpResult getFifoAllocateResult(mlir::Value fifo_slot) {
+  auto private_result = mlir::dyn_cast<mlir::OpResult>(fifo_slot);
+  if (!private_result) return {};
+  auto priv_op =
+      mlir::dyn_cast<mlir::ktdf::PrivateOp>(private_result.getOwner());
+  if (!priv_op) return {};
+  mlir::Value yielded =
+      priv_op.getYieldOp().getOperands()[private_result.getResultNumber()];
+  auto alloc_result = mlir::dyn_cast<mlir::OpResult>(yielded);
+  if (!alloc_result ||
+      !mlir::isa<mlir::ktdf::FifoAllocateOp>(alloc_result.getOwner()))
+    return {};
+  return alloc_result;
+}
+
+namespace {
+/// What carries a flow's data across one boundary between two stages: a
+/// buffer, FIFO slot or original memref, and how a transfer addresses it.
+struct Carrier {
+  const PrivateResourceSpec* spec = nullptr;
+  size_t slot_index = 0;
+  llvm::SmallVector<mlir::Value> indices;
+  llvm::SmallVector<mlir::OpFoldResult> sizes;
+  mlir::AffineMap map;
+};
+
+/// Data that one original stage passes to another, and the route it takes.
 ///
-/// The path runs from the producer's resource to the consumer's resource. Its
-/// first nodes belong to the producer and its last nodes to the consumer. Any
-/// nodes left in the middle are hops the data passes through. Step 1 gives
-/// each hop to the stage that runs on its unit, or creates a new (synthetic)
-/// stage for it.
-struct EdgeSegment {
+/// The data is carried by a FIFO slot or a memref, the carrier. One op of the
+/// producer stage writes the carrier, one op of the consumer stage reads it,
+/// and the producer stage has a dependency on the consumer stage.
+///
+/// The route is a routing-graph path from the producer's resource to the
+/// consumer's resource. Its first nodes belong to the producer and its last
+/// nodes to the consumer. Any nodes left in the middle are hops the data
+/// passes through. Step 1 gives each hop to the stage that runs on its unit,
+/// or creates a new (synthetic) stage for it. Those hop stages form the
+/// flow's chain.
+struct DataFlow {
+  mlir::Value carrier;
+  mlir::Operation* producer_op = nullptr;
+  mlir::Operation* consumer_op = nullptr;
   StageNode* producer = nullptr;
   StageNode* consumer = nullptr;
+
   scheduler::arch_view::RoutingGraph::Path path;
   // Last path index owned by the producer.
   size_t producer_end = 0;
@@ -677,15 +788,126 @@ struct EdgeSegment {
   ResourceType producer_unit;
   ResourceType consumer_unit;
 
-  /// The range [middleBegin(), middleEnd()) of path indices that need new
+  // The hop stages, in data-flow order. Set by Step 1.
+  llvm::SmallVector<StageNode*, 2> chain;
+  // Where the data passes from one stage of producer -> chain -> consumer to
+  // the next. boundaries[k] is the path index of the first node after
+  // boundary k. Boundary 0 is between the producer and chain.front(), and
+  // boundary chain.size() is between chain.back() and the consumer. Empty
+  // when the chain is empty. Set by Step 1.
+  llvm::SmallVector<size_t, 3> boundaries;
+  // What carries the data across each boundary. Steps 2 and 3 fill it in.
+  llvm::SmallVector<Carrier, 3> carriers;
+
+  bool carrierIsMemref() const {
+    return mlir::isa<mlir::MemRefType>(carrier.getType());
+  }
+
+  /// The range [middleBegin(), middleEnd()) of path indices that need hop
   /// stages. It is empty when the two stages own the whole path.
   size_t middleBegin() const { return producer_end + 1; }
   size_t middleEnd() const { return consumer_begin; }
 };
 }  // namespace
 
-/// Find the routing-graph path for every dependency between original stages,
-/// and work out which part of each path belongs to which stage.
+/// Find the data each original stage passes to the stages it has a
+/// dependency on. See DataFlow.
+///
+/// A FIFO slot is a carrier when its producer and its consumer are both in
+/// the pipeline. A memref is a carrier when, within the pipeline, exactly one
+/// data transfer writes it, exactly one data transfer in another stage reads
+/// it, and nothing else uses it. Other memrefs, such as the pipeline's inputs
+/// and outputs, are not passed between stages. A dependency that no carrier
+/// follows only orders the two stages, and gets no flow.
+///
+/// How it works: first record every use of every memref in the pipeline.
+/// Then walk the ops of each stage in order, and pair each carrier an op
+/// writes with the op that reads it. The flows are grouped by producer, in
+/// topological order, and then by consumer, in the order of the producer's
+/// dependencies. This keeps new stages and transfers in a stable order.
+static std::vector<DataFlow> collectDataFlows(
+    llvm::ArrayRef<StageNode*> sorted_stages, const FifoEndpoints& endpoints) {
+  using OpInStage = std::pair<mlir::Operation*, StageNode*>;
+  struct MemrefUses {
+    llvm::SmallVector<OpInStage, 1> writers;
+    llvm::SmallVector<OpInStage, 1> readers;
+    bool other_use = false;
+  };
+  llvm::DenseMap<mlir::Value, MemrefUses> memref_uses;
+  for (StageNode* stage : sorted_stages) {
+    stage->getOperation()->walk([&](mlir::Operation* op) {
+      auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op);
+      for (mlir::Value value : op->getOperands()) {
+        if (!mlir::isa<mlir::MemRefType>(value.getType())) continue;
+        MemrefUses& uses = memref_uses[value];
+        if (transfer && value == transfer.getDestination())
+          uses.writers.push_back({op, stage});
+        else if (transfer && value == transfer.getSource())
+          uses.readers.push_back({op, stage});
+        else
+          uses.other_use = true;
+      }
+    });
+  }
+
+  // The op that reads \p carrier, written by \p writer, and its stage.
+  auto findReader = [&](mlir::Value carrier,
+                        mlir::Operation* writer) -> OpInStage {
+    if (mlir::isa<mlir::ktdf::FifoSlotType>(carrier.getType())) {
+      auto producer_it = endpoints.producers.find(carrier);
+      auto consumer_it = endpoints.consumers.find(carrier);
+      if (producer_it == endpoints.producers.end() ||
+          producer_it->second.op != writer ||
+          consumer_it == endpoints.consumers.end())
+        return {};
+      return {consumer_it->second.op, consumer_it->second.stage};
+    }
+    auto uses_it = memref_uses.find(carrier);
+    if (uses_it == memref_uses.end()) return {};
+    const MemrefUses& uses = uses_it->second;
+    if (uses.writers.size() != 1 || uses.readers.size() != 1 || uses.other_use)
+      return {};
+    return uses.readers.front();
+  };
+
+  std::vector<DataFlow> flows;
+  for (StageNode* producer : sorted_stages) {
+    // The flows out of this stage, in the order of the ops that write them.
+    std::vector<DataFlow> outgoing;
+    producer->getOperation()->walk([&](mlir::Operation* op) {
+      mlir::Value written;
+      if (auto write_op = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op))
+        written = write_op.getFifoSlot();
+      else if (auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op))
+        written = transfer.getDestination();
+      else if (auto ind_transfer =
+                   mlir::dyn_cast<mlir::ktdf::IndDataTransferOp>(op))
+        if (ind_transfer.isGather()) written = ind_transfer.getDirDst();
+      if (!written) return;
+
+      auto [reader, consumer] = findReader(written, op);
+      if (!consumer || consumer == producer) return;
+      DataFlow flow;
+      flow.carrier = written;
+      flow.producer_op = op;
+      flow.consumer_op = reader;
+      flow.producer = producer;
+      flow.consumer = consumer;
+      outgoing.push_back(std::move(flow));
+    });
+
+    llvm::SmallPtrSet<StageNode*, 4> seen;
+    for (StageNode* consumer : producer->getDependencies()) {
+      if (!seen.insert(consumer).second) continue;
+      for (const DataFlow& flow : outgoing)
+        if (flow.consumer == consumer) flows.push_back(flow);
+    }
+  }
+  return flows;
+}
+
+/// Find the routing-graph path of every flow, and work out which part of it
+/// belongs to which stage.
 ///
 /// A stage owns the node for its own resource. A load-side stage also owns
 /// the load unit right after its memory, because that unit reads the memory.
@@ -697,78 +919,68 @@ struct EdgeSegment {
 /// DDR and MNILU, the compute stage owns SFU, and L1 -> L1LU in the middle
 /// is a hop that needs a stage on L1LU.
 ///
-/// Each dependency gets its own path, so stages may branch and merge freely.
-/// Fails if some dependency has no path in the routing graph.
-static llvm::FailureOr<llvm::SmallVector<EdgeSegment>> buildEdgeSegments(
-    llvm::ArrayRef<StageNode*> sorted_stages, const StageSideMap& sides,
+/// The path depends only on the resources of the two stages, so all flows
+/// between the same two stages get the same path. Fails if some flow has no
+/// path in the routing graph.
+static mlir::LogicalResult routeDataFlows(
+    llvm::MutableArrayRef<DataFlow> flows, const StageSideMap& sides,
     const scheduler::arch_view::RoutingGraph& arch_graph,
     const PathExpansionPlan* plan) {
   using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
 
-  auto nodeAt = [&](const EdgeSegment& seg, size_t idx) {
-    auto node = arch_graph.getNode(seg.path[idx]);
+  auto nodeAt = [&](const DataFlow& flow, size_t idx) {
+    auto node = arch_graph.getNode(flow.path[idx]);
     assert(node && "node in path must exist in graph");
     return *node;
   };
 
-  llvm::SmallVector<EdgeSegment> segments;
-  llvm::DenseSet<std::pair<StageNode*, StageNode*>> seen;
-  for (StageNode* producer : sorted_stages) {
-    for (StageNode* consumer : producer->getDependencies()) {
-      if (!seen.insert({producer, consumer}).second) continue;
+  for (DataFlow& flow : flows) {
+    std::optional<scheduler::arch_view::RoutingGraph::Path> path =
+        arch_graph.findShortestPath(
+            arch_graph.getNodeIdForResource(
+                plan->stage_info.at(flow.producer).stage_resource),
+            arch_graph.getNodeIdForResource(
+                plan->stage_info.at(flow.consumer).stage_resource));
+    if (!path || path->empty()) {
+      LDBG(1) << "No routing path from stage " << flow.producer->getStageId()
+              << " to stage " << flow.consumer->getStageId();
+      return mlir::failure();
+    }
+    flow.path = std::move(*path);
 
-      EdgeSegment seg;
-      seg.producer = producer;
-      seg.consumer = consumer;
-      std::optional<scheduler::arch_view::RoutingGraph::Path> path =
-          arch_graph.findShortestPath(
-              arch_graph.getNodeIdForResource(
-                  plan->stage_info.at(producer).stage_resource),
-              arch_graph.getNodeIdForResource(
-                  plan->stage_info.at(consumer).stage_resource));
-      if (!path || path->empty()) {
-        LDBG(1) << "No routing path from stage " << producer->getStageId()
-                << " to stage " << consumer->getStageId();
-        return mlir::failure();
-      }
-      seg.path = std::move(*path);
+    size_t last = flow.path.size() - 1;
+    flow.consumer_begin = last;
 
-      size_t last = seg.path.size() - 1;
-      seg.consumer_begin = last;
+    // A load-side producer owns the load unit right after its memory,
+    // unless that unit is the consumer's own resource.
+    if (sides.at(flow.producer) == StageSide::kLoad && last > 1 &&
+        nodeAt(flow, 0).kind == RK::Memory &&
+        nodeAt(flow, 1).kind == RK::LoadStoreUnit) {
+      flow.producer_end = 1;
+      flow.producer_unit = nodeAt(flow, 1).resource;
+    }
 
-      // A load-side producer owns the load unit right after its memory,
-      // unless that unit is the consumer's own resource.
-      if (sides.at(producer) == StageSide::kLoad && last > 1 &&
-          nodeAt(seg, 0).kind == RK::Memory &&
-          nodeAt(seg, 1).kind == RK::LoadStoreUnit) {
-        seg.producer_end = 1;
-        seg.producer_unit = nodeAt(seg, 1).resource;
-      }
-
-      // A store-side consumer owns the store unit right before its memory,
-      // unless the producer already owns it.
-      if (sides.at(consumer) == StageSide::kStore &&
-          last > seg.producer_end + 1 && nodeAt(seg, last).kind == RK::Memory &&
-          nodeAt(seg, last - 1).kind == RK::LoadStoreUnit) {
-        seg.consumer_begin = last - 1;
-        seg.consumer_unit = nodeAt(seg, last - 1).resource;
-      }
-
-      segments.push_back(std::move(seg));
+    // A store-side consumer owns the store unit right before its memory,
+    // unless the producer already owns it.
+    if (sides.at(flow.consumer) == StageSide::kStore &&
+        last > flow.producer_end + 1 && nodeAt(flow, last).kind == RK::Memory &&
+        nodeAt(flow, last - 1).kind == RK::LoadStoreUnit) {
+      flow.consumer_begin = last - 1;
+      flow.consumer_unit = nodeAt(flow, last - 1).resource;
     }
   }
-  return segments;
+  return mlir::success();
 }
 
 /// Return true if path expansion has to add stages: some path passes through
 /// a memory or compute unit that no stage owns. A load/store unit with no
 /// stage does not count on its own.
 static bool needsExpansion(
-    llvm::ArrayRef<EdgeSegment> segments,
+    llvm::ArrayRef<DataFlow> flows,
     const scheduler::arch_view::RoutingGraph& arch_graph) {
-  for (const EdgeSegment& seg : segments) {
-    for (size_t i = seg.middleBegin(); i < seg.middleEnd(); ++i) {
-      auto node = arch_graph.getNode(seg.path[i]);
+  for (const DataFlow& flow : flows) {
+    for (size_t i = flow.middleBegin(); i < flow.middleEnd(); ++i) {
+      auto node = arch_graph.getNode(flow.path[i]);
       assert(node && "node in path must exist in graph");
       if (node->kind != scheduler::arch_view::RoutingGraph::ResourceNode::
                             ResourceKind::LoadStoreUnit)
@@ -782,23 +994,16 @@ static bool needsExpansion(
 // Step 1: Add Stages Along Each Path
 //===----------------------------------------------------------------------===//
 
-/// For each dependency between two original stages that needed extra stages,
-/// those stages in data-flow order. They are new (synthetic) stages, or
-/// existing stages that already run on the unit the data must pass through.
-using EdgeChainMap = llvm::DenseMap<std::pair<StageNode*, StageNode*>,
-                                    llvm::SmallVector<StageNode*, 2>>;
-
 /// Set the applicable unit of every original stage, and check that no two of
 /// them run on the same unit. A pipeline can run only one stage on each unit,
 /// so an input where two stages end up on the same unit is invalid.
 ///
 /// A stage pinned to a compute or load/store unit runs on that unit. Any other
-/// stage gets the load/store unit its paths give it (see buildEdgeSegments).
-/// A stage with several dependencies on the same side must get the same unit
-/// from all of them.
+/// stage gets the load/store unit its flows give it (see routeDataFlows). A
+/// stage with several flows on the same side must get the same unit from all
+/// of them.
 static mlir::LogicalResult assignOriginalStageUnits(
-    llvm::ArrayRef<EdgeSegment> segments,
-    llvm::ArrayRef<StageNode*> sorted_stages,
+    llvm::ArrayRef<DataFlow> flows, llvm::ArrayRef<StageNode*> sorted_stages,
     const scheduler::arch_view::RoutingGraph& arch_graph,
     PathExpansionPlan* plan) {
   using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
@@ -824,9 +1029,9 @@ static mlir::LogicalResult assignOriginalStageUnits(
     current = unit;
     return mlir::success();
   };
-  for (const EdgeSegment& seg : segments) {
-    if (mlir::failed(setUnit(seg.producer, seg.producer_unit)) ||
-        mlir::failed(setUnit(seg.consumer, seg.consumer_unit)))
+  for (const DataFlow& flow : flows) {
+    if (mlir::failed(setUnit(flow.producer, flow.producer_unit)) ||
+        mlir::failed(setUnit(flow.consumer, flow.consumer_unit)))
       return mlir::failure();
   }
 
@@ -850,19 +1055,22 @@ static mlir::LogicalResult assignOriginalStageUnits(
 /// Step 1: Add the stages that move data through memories and units that have
 /// no stage of their own on a path.
 ///
-/// How it works, for each dependency between two original stages:
+/// How it works, for each flow:
 ///  1. The middle of the path is split into hops. A memory followed by the
 ///     load unit that reads it, or a store unit followed by the memory it
 ///     writes, is one hop that moves data through that memory. A load/store
-///     unit on its own is a hop with no memory.
+///     unit on its own is a hop with no memory. The places where one hop ends
+///     and the next begins are recorded as the flow's boundaries.
 ///  2. Each hop is given to the stage that already runs on its unit, so that
 ///     no unit ever runs two stages. Only if no stage runs on the unit yet is
 ///     a new stage created for it. The existing stage may be an original
-///     stage or a new stage made for another dependency, and it must use the
-///     same memory as the hop.
-///  3. The dependency producer -> consumer becomes
-///     producer -> hop stages -> consumer. Dependencies that need no hops are
-///     left alone.
+///     stage or a new stage made for another flow, and it must use the same
+///     memory as the hop.
+///
+/// Then, for each pair of stages with a flow that got hops, the dependency
+/// producer -> consumer becomes producer -> hop stages -> consumer for each
+/// such flow. The direct dependency is kept only if some flow between the two
+/// stages needs no hops.
 ///
 /// Giving a hop to an existing stage makes that stage depend on the producer.
 /// If the existing stage is upstream of the producer, that creates a cycle;
@@ -870,14 +1078,13 @@ static mlir::LogicalResult assignOriginalStageUnits(
 ///
 /// New stages are placed in the pipeline right after their producer (after
 /// any new stages already placed there), which keeps the printed order close
-/// to the data-flow order. The hop stages of each dependency are recorded in
-/// \p edge_chains.
-static mlir::LogicalResult expandStageEdges(
+/// to the data-flow order.
+static mlir::LogicalResult expandDataFlows(
     PipelineTree& tree, PipelineNode* pipeline,
-    llvm::ArrayRef<EdgeSegment> segments,
+    llvm::MutableArrayRef<DataFlow> flows,
     llvm::ArrayRef<StageNode*> sorted_stages,
     const scheduler::arch_view::RoutingGraph& arch_graph,
-    PathExpansionPlan* plan, int& next_stage_id, EdgeChainMap& edge_chains) {
+    PathExpansionPlan* plan, int& next_stage_id) {
   using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
 
   // The stage running on each unit. assignOriginalStageUnits() made sure the
@@ -891,15 +1098,10 @@ static mlir::LogicalResult expandStageEdges(
   // The stage after which the next new stage following a producer goes.
   llvm::DenseMap<StageNode*, StageNode*> insert_after;
 
-  auto addDependency = [](StageNode* from, StageNode* to) {
-    if (!llvm::is_contained(from->getDependencies(), to))
-      from->addDependency(to);
-  };
-
-  for (const EdgeSegment& seg : segments) {
-    llvm::SmallVector<StageNode*, 2> chain;
+  for (DataFlow& flow : flows) {
+    llvm::SmallVector<StageNode*, 2>& chain = flow.chain;
     StageNode*& last_inserted =
-        insert_after.try_emplace(seg.producer, seg.producer).first->second;
+        insert_after.try_emplace(flow.producer, flow.producer).first->second;
 
     // Find or create the stage for the hop through memory \p memory (may be
     // null) on unit \p unit.
@@ -921,17 +1123,17 @@ static mlir::LogicalResult expandStageEdges(
       }
 
       StageNode* owner = owner_it->second;
-      if (owner == seg.producer || owner == seg.consumer ||
+      if (owner == flow.producer || owner == flow.consumer ||
           llvm::is_contained(chain, owner)) {
-        LDBG(1) << "Path from stage " << seg.producer->getStageId()
-                << " to stage " << seg.consumer->getStageId()
+        LDBG(1) << "Path from stage " << flow.producer->getStageId()
+                << " to stage " << flow.consumer->getStageId()
                 << " passes through unit " << unit
                 << " twice, but a unit can run only one stage";
         return mlir::failure();
       }
       if (plan->getStageInfo(owner).stage_resource != memory) {
-        LDBG(1) << "Path from stage " << seg.producer->getStageId()
-                << " to stage " << seg.consumer->getStageId() << " needs unit "
+        LDBG(1) << "Path from stage " << flow.producer->getStageId()
+                << " to stage " << flow.consumer->getStageId() << " needs unit "
                 << unit << " for memory " << memory << ", but stage "
                 << owner->getStageId() << " already uses it for memory "
                 << plan->getStageInfo(owner).stage_resource;
@@ -941,12 +1143,13 @@ static mlir::LogicalResult expandStageEdges(
       return mlir::success();
     };
 
-    size_t end = seg.middleEnd();
-    for (size_t i = seg.middleBegin(); i < end;) {
-      auto node = arch_graph.getNode(seg.path[i]);
+    size_t end = flow.middleEnd();
+    flow.boundaries.push_back(flow.middleBegin());
+    for (size_t i = flow.middleBegin(); i < end;) {
+      auto node = arch_graph.getNode(flow.path[i]);
       assert(node && "node in path must exist in graph");
       decltype(node) next;
-      if (i + 1 < end) next = arch_graph.getNode(seg.path[i + 1]);
+      if (i + 1 < end) next = arch_graph.getNode(flow.path[i + 1]);
 
       switch (node->kind) {
         case RK::Memory:
@@ -954,8 +1157,8 @@ static mlir::LogicalResult expandStageEdges(
           // it.
           if (!next || next->kind != RK::LoadStoreUnit) {
             LDBG(1) << "Memory " << node->resource << " between stage "
-                    << seg.producer->getStageId() << " and stage "
-                    << seg.consumer->getStageId()
+                    << flow.producer->getStageId() << " and stage "
+                    << flow.consumer->getStageId()
                     << " has no load unit after it";
             return mlir::failure();
           }
@@ -978,22 +1181,44 @@ static mlir::LogicalResult expandStageEdges(
           // Hop stages only move data between memories through load/store
           // units. Passing data through a compute unit would need a compute
           // stage that relays it, which path expansion does not create.
-          LDBG(1) << "Path from stage " << seg.producer->getStageId()
-                  << " to stage " << seg.consumer->getStageId()
+          LDBG(1) << "Path from stage " << flow.producer->getStageId()
+                  << " to stage " << flow.consumer->getStageId()
                   << " passes through compute unit " << node->resource
                   << ", which has no stage";
           return mlir::failure();
       }
+      flow.boundaries.push_back(i);
     }
+    if (chain.empty()) flow.boundaries.clear();
+  }
 
-    if (chain.empty()) continue;
-    seg.producer->nullifyDependency(seg.consumer);
-    seg.producer->removeNullifiedDependencies();
-    addDependency(seg.producer, chain.front());
-    for (size_t k = 0; k + 1 < chain.size(); ++k)
-      addDependency(chain[k], chain[k + 1]);
-    addDependency(chain.back(), seg.consumer);
-    edge_chains[{seg.producer, seg.consumer}] = std::move(chain);
+  // Rewire the dependencies of every pair of stages with a flow that got
+  // hops.
+  llvm::MapVector<std::pair<StageNode*, StageNode*>,
+                  llvm::SmallVector<const DataFlow*, 2>>
+      flows_by_pair;
+  for (const DataFlow& flow : flows)
+    flows_by_pair[{flow.producer, flow.consumer}].push_back(&flow);
+
+  auto addDependency = [](StageNode* from, StageNode* to) {
+    if (!llvm::is_contained(from->getDependencies(), to))
+      from->addDependency(to);
+  };
+  for (const auto& [pair, pair_flows] : flows_by_pair) {
+    auto [producer, consumer] = pair;
+    auto hasChain = [](const DataFlow* flow) { return !flow->chain.empty(); };
+    if (llvm::none_of(pair_flows, hasChain)) continue;
+    if (llvm::all_of(pair_flows, hasChain)) {
+      producer->nullifyDependency(consumer);
+      producer->removeNullifiedDependencies();
+    }
+    for (const DataFlow* flow : pair_flows) {
+      if (!hasChain(flow)) continue;
+      addDependency(producer, flow->chain.front());
+      for (size_t k = 0; k + 1 < flow->chain.size(); ++k)
+        addDependency(flow->chain[k], flow->chain[k + 1]);
+      addDependency(flow->chain.back(), consumer);
+    }
   }
 
   return mlir::success();
@@ -1042,433 +1267,160 @@ static mlir::LogicalResult orderStagesByDependencies(PipelineNode* pipeline) {
 }
 
 //===----------------------------------------------------------------------===//
-// Stage Graph Helpers
+// Step 2: Adapt the Ends of Each Flow
 //===----------------------------------------------------------------------===//
 
 namespace {
-/// One end (producer or consumer) of a FIFO slot inside an original stage.
-struct FifoEndpoint {
-  mlir::Operation* op = nullptr;
-  StageNode* stage = nullptr;
-  // Whether the FIFO slot is the op's source operand (always true for
-  // read_from_fifo, always false for write_to_fifo).
-  bool fifo_is_source = false;
+/// What carries a flow's data across one boundary between two stages of
+/// producer -> chain -> consumer: a memory buffer, or a FIFO between two
+/// units. Exactly one of memory and fifo_src/fifo_dest is set.
+struct BoundaryPlace {
+  ResourceType memory;
+  ResourceType fifo_src;
+  ResourceType fifo_dest;
 };
 
-/// The producer and consumer of every FIFO slot used by the original stages.
-struct FifoEndpoints {
-  llvm::MapVector<mlir::Value, FifoEndpoint> producers;
-  llvm::MapVector<mlir::Value, FifoEndpoint> consumers;
-  // FIFO slots used by an indirect data transfer.
-  llvm::SmallPtrSet<mlir::Value, 4> indirect_slots;
-};
+/// The shape and element type of the data a flow moves.
+struct Tile {
+  llvm::SmallVector<int64_t> shape;
+  mlir::Type element_type;
 
-/// Ties a transfer created in Step 2 to the hop stage it exchanges data with
-/// and to the original FIFO slot it replaces. Step 3 uses this to pair up the
-/// transfer that writes into each hop stage with the one that reads from it.
-struct TransferLink {
-  // The stage the transfer belongs to.
-  StageNode* stage = nullptr;
-  // The hop stage on the other side of the transfer.
-  StageNode* hop = nullptr;
-  mlir::Value fifo_slot;
-  // Whether the transfer writes into the hop stage (rather than reading from
-  // it).
-  bool writes_to_hop = false;
+  int64_t numElements() const {
+    int64_t n = 1;
+    for (int64_t dim : shape) n *= dim;
+    return n;
+  }
 };
 }  // namespace
 
-/// Kept in insertion order so Step 3 creates transfers in a stable order.
-using TransferLinkMap =
-    llvm::MapVector<const TransferMaterializationInfo*, TransferLink>;
-using StagePredecessorMap =
-    llvm::DenseMap<StageNode*, llvm::SmallVector<StageNode*, 2>>;
-
-/// Map each stage to the stages that feed it. Stages only record the stages
-/// they feed, so this gives the other direction.
-static StagePredecessorMap buildPredecessorMap(
-    llvm::ArrayRef<StageNode*> stages) {
-  StagePredecessorMap preds;
-  for (StageNode* stage : stages)
-    for (StageNode* succ : stage->getDependencies())
-      preds[succ].push_back(stage);
-  return preds;
-}
-
-/// Find the op that writes and the op that reads each FIFO slot used by the
-/// original stages. Fails if a slot has more than one writer or reader.
-static mlir::LogicalResult collectFifoEndpoints(
-    llvm::ArrayRef<StageNode*> stages, FifoEndpoints& endpoints) {
-  for (StageNode* stage : stages) {
-    if (isIntermediateStage(stage)) continue;
-    auto stage_op = mlir::cast<mlir::ktdf::StageOp>(stage->getOperation());
-
-    auto record = [&](llvm::MapVector<mlir::Value, FifoEndpoint>& ends,
-                      mlir::Value fifo_slot, mlir::Operation* op,
-                      bool fifo_is_source) -> mlir::WalkResult {
-      if (!ends.insert({fifo_slot, {op, stage, fifo_is_source}}).second) {
-        op->emitError("path-expansion: FIFO slot has more than one ")
-            << (&ends == &endpoints.producers ? "producer" : "consumer");
-        return mlir::WalkResult::interrupt();
-      }
-      return mlir::WalkResult::advance();
-    };
-
-    mlir::WalkResult result = stage_op.walk([&](mlir::Operation* op) {
-      if (auto read_op = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op))
-        return record(endpoints.consumers, read_op.getFifoSlot(), op, true);
-      if (auto write_op = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op))
-        return record(endpoints.producers, write_op.getFifoSlot(), op, false);
-      if (auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
-        if (mlir::isa<mlir::ktdf::FifoSlotType>(transfer.getSource().getType()))
-          if (record(endpoints.consumers, transfer.getSource(), op, true)
-                  .wasInterrupted())
-            return mlir::WalkResult::interrupt();
-        if (mlir::isa<mlir::ktdf::FifoSlotType>(
-                transfer.getDestination().getType()))
-          return record(endpoints.producers, transfer.getDestination(), op,
-                        false);
-        return mlir::WalkResult::advance();
-      }
-      if (auto ind_transfer =
-              mlir::dyn_cast<mlir::ktdf::IndDataTransferOp>(op)) {
-        bool is_gather = ind_transfer.isGather();
-        mlir::Value fifo_side =
-            is_gather ? ind_transfer.getDirDst() : ind_transfer.getDirSrc();
-        if (!mlir::isa<mlir::ktdf::FifoSlotType>(fifo_side.getType()))
-          return mlir::WalkResult::advance();
-        endpoints.indirect_slots.insert(fifo_side);
-        return is_gather ? record(endpoints.producers, fifo_side, op, false)
-                         : record(endpoints.consumers, fifo_side, op, true);
-      }
-      return mlir::WalkResult::advance();
-    });
-    if (result.wasInterrupted()) return mlir::failure();
-  }
-  return mlir::success();
-}
-
-/// Return the fifo.allocate result that \p fifo_slot (a ktdf.private result)
-/// is yielded from, or a null result if it cannot be traced.
-static mlir::OpResult getFifoAllocateResult(mlir::Value fifo_slot) {
-  auto private_result = mlir::dyn_cast<mlir::OpResult>(fifo_slot);
-  if (!private_result) return {};
-  auto priv_op =
-      mlir::dyn_cast<mlir::ktdf::PrivateOp>(private_result.getOwner());
-  if (!priv_op) return {};
-  mlir::Value yielded =
-      priv_op.getYieldOp().getOperands()[private_result.getResultNumber()];
-  auto alloc_result = mlir::dyn_cast<mlir::OpResult>(yielded);
-  if (!alloc_result ||
-      !mlir::isa<mlir::ktdf::FifoAllocateOp>(alloc_result.getOwner()))
-    return {};
-  return alloc_result;
-}
-
-/// Return the hop stage that original stage \p stage exchanges data with
-/// over \p fifo_slot, or nullptr if it still exchanges data directly with
-/// another original stage.
+/// Return the place that carries \p flow across boundary \p k. See
+/// DataFlow::boundaries.
 ///
-/// The FIFO's other end is normally another original stage. If Step 1 put hop
-/// stages on the dependency between the two, the answer is the hop stage
-/// right next to \p stage. If the other end is not in this pipeline, fall back
-/// to the only stage feeding \p stage (when it reads) or fed by it (when it
-/// writes), as long as that is a new stage.
-static StageNode* findFifoHop(StageNode* stage, mlir::Value fifo_slot,
-                              bool stage_reads, const FifoEndpoints& endpoints,
-                              const EdgeChainMap& edge_chains,
-                              const StagePredecessorMap& preds) {
-  const llvm::MapVector<mlir::Value, FifoEndpoint>& other_ends =
-      stage_reads ? endpoints.producers : endpoints.consumers;
-  auto other_it = other_ends.find(fifo_slot);
-  if (other_it != other_ends.end()) {
-    StageNode* other = other_it->second.stage;
-    auto chain_it =
-        edge_chains.find(stage_reads ? std::make_pair(other, stage)
-                                     : std::make_pair(stage, other));
-    if (chain_it == edge_chains.end()) return nullptr;
-    return stage_reads ? chain_it->second.back() : chain_it->second.front();
+/// How it works: look at the last path node of the stage before the boundary
+/// and the first path node of the stage after it. If either is a memory, the
+/// data crosses in a buffer in that memory. Otherwise both are units, and the
+/// data crosses in a FIFO from the first unit to the second.
+static BoundaryPlace boundaryPlace(
+    const DataFlow& flow, size_t k,
+    const scheduler::arch_view::RoutingGraph& arch_graph) {
+  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
+  size_t idx = flow.boundaries[k];
+  auto left = arch_graph.getNode(flow.path[idx - 1]);
+  auto right = arch_graph.getNode(flow.path[idx]);
+  assert(left && right && "node in path must exist in graph");
+  if (right->kind == RK::Memory) return {right->resource, {}, {}};
+  if (left->kind == RK::Memory) return {left->resource, {}, {}};
+  return {{}, left->resource, right->resource};
+}
+
+/// Return the shape of the data that \p op moves on one side, the side that
+/// path expansion is about to replace (its source if \p replaces_source).
+/// Fails if the shape is not static.
+///
+/// For a data transfer, the shape is taken from its memref side, since the
+/// FIFO side may give only a number of elements. For an indirect transfer,
+/// it is taken from the side being replaced.
+static llvm::FailureOr<Tile> tileOf(mlir::Operation* op, bool replaces_source) {
+  mlir::Value side;
+  llvm::SmallVector<mlir::OpFoldResult> sizes;
+  if (auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
+    bool use_source = replaces_source;
+    mlir::Value replaced =
+        replaces_source ? transfer.getSource() : transfer.getDestination();
+    if (!mlir::isa<mlir::MemRefType>(replaced.getType()))
+      use_source = !use_source;
+    side = use_source ? transfer.getSource() : transfer.getDestination();
+    sizes = use_source ? transfer.getMixedSourceSizes()
+                       : transfer.getMixedDestSizes();
+  } else {
+    auto ind_transfer = mlir::cast<mlir::ktdf::IndDataTransferOp>(op);
+    side =
+        replaces_source ? ind_transfer.getDirSrc() : ind_transfer.getDirDst();
+    sizes = replaces_source ? ind_transfer.getMixedDirSrcSizes()
+                            : ind_transfer.getMixedDirDstSizes();
   }
 
-  llvm::SmallVector<StageNode*, 2> neighbours;
-  if (stage_reads)
-    neighbours = preds.lookup(stage);
+  Tile tile;
+  if (auto memref_type = mlir::dyn_cast<mlir::MemRefType>(side.getType()))
+    tile.element_type = memref_type.getElementType();
   else
-    neighbours.append(stage->getDependencies().begin(),
-                      stage->getDependencies().end());
-  if (neighbours.size() == 1 && isIntermediateStage(neighbours.front()))
-    return neighbours.front();
-  return nullptr;
+    tile.element_type =
+        mlir::cast<mlir::ktdf::FifoSlotType>(side.getType()).getElementType();
+  for (mlir::OpFoldResult size : sizes) {
+    std::optional<int64_t> dim = mlir::getConstantIntValue(size);
+    if (!dim) return mlir::failure();
+    tile.shape.push_back(*dim);
+  }
+  return tile;
 }
 
-//===----------------------------------------------------------------------===//
-// Step 2: Classify Original Stages and Create Private Resources
-//===----------------------------------------------------------------------===//
-
-/// Step 2: Adapt the original stages that exchange data with a hop stage, and
-/// create the private resources (buffers and FIFOs) they need.
-///
-/// A hop stage sits on a dependency between two original stages and moves the
-/// data through a memory or unit the path needs, such as L1. It is either a
-/// new stage or an existing stage that took on the extra work (see
-/// expandStageEdges). The original stages on either side must now exchange
-/// data with the hop stage instead of with each other. Each data transfer,
-/// read_from_fifo and write_to_fifo in an original stage is checked: its FIFO
-/// slot leads to the stage at the other end of the FIFO, and if there is a hop
-/// stage on the way there, the op is adapted to exchange data with it:
-///   - A data transfer between memory and a FIFO (kAdaptTransfer) uses a
-///     buffer in the hop stage's memory instead of the FIFO.
-///   - A read_from_fifo or write_to_fifo (kAdaptFifoKinds) uses a FIFO
-///     between the hop stage's unit and this stage.
-///
-/// Finding the hop through the FIFO, not by position in the stage list, is
-/// what lets one stage exchange data with several hop stages, for example a
-/// compute stage fed by two load stages.
-///
-/// New FIFOs are created per original fifo.allocate, so slots that came from
-/// different allocations stay in different allocations. Every adapted op is
-/// recorded in \p links for Step 3.
-static mlir::LogicalResult classifyOriginalStages(
-    llvm::ArrayRef<StageNode*> expanded_stages,
-    const StagePredecessorMap& preds, const FifoEndpoints& endpoints,
-    const EdgeChainMap& edge_chains,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
-    PathExpansionPlan* plan, TransferLinkMap& links) {
-  // New FIFOs, keyed by the original fifo.allocate and the new endpoints.
-  using FifoKey =
-      std::tuple<mlir::Operation*, mlir::Attribute, mlir::Attribute>;
-  llvm::DenseMap<FifoKey, PrivateResourceSpec*> fifo_specs;
-  llvm::DenseMap<FifoKey, size_t> fifo_next_slot;
-
-  // Only the original stages at either end of a dependency that got hop
-  // stages need adapting.
-  llvm::SmallPtrSet<StageNode*, 8> chain_ends;
-  for (const auto& [edge, chain] : edge_chains) {
-    chain_ends.insert(edge.first);
-    chain_ends.insert(edge.second);
-  }
-
-  for (StageNode* current_stage : expanded_stages) {
-    if (!chain_ends.contains(current_stage)) continue;
-
-    StageMaterializationInfo& stage_info = plan->getStageInfo(current_stage);
-
-    auto stage_op =
-        mlir::cast<mlir::ktdf::StageOp>(current_stage->getOperation());
-
-    // The hop stage this stage exchanges data with over \p fifo_slot, or
-    // nullptr if there is none.
-    auto hopNeighbour = [&](mlir::Value fifo_slot,
-                            bool stage_reads) -> StageNode* {
-      return findFifoHop(current_stage, fifo_slot, stage_reads, endpoints,
-                         edge_chains, preds);
-    };
-
-    // --- Transfer stage (kAdaptTransfer): memref/FIFO ↔ intermediate buffer
-    // --- Shared helper: given a template op, its intermediate-buffer-side
-    // element type and tile sizes, and its FIFO operand, check whether the
-    // FIFO leads to a hop stage. If so, create the intermediate buffer spec,
-    // build the edge, and register the TransferMaterializationInfo.
-    // \p intermediate_is_source says whether the FIFO is the op's source.
-    auto classifyTransferStage =
-        [&](mlir::Operation* template_op, mlir::Type element_type,
-            llvm::ArrayRef<mlir::OpFoldResult> tile_sizes,
-            mlir::Value fifo_slot, bool intermediate_is_source) {
-          StageNode* neighbour =
-              hopNeighbour(fifo_slot, /*stage_reads=*/intermediate_is_source);
-          if (!neighbour) return;
-          ResourceType intermediate_resource =
-              plan->getStageInfo(neighbour).stage_resource;
-
-          llvm::SmallVector<int64_t> buffer_shape;
-          for (mlir::OpFoldResult ofr : tile_sizes) {
-            auto int_attr = mlir::dyn_cast<mlir::IntegerAttr>(
-                ofr.dyn_cast<mlir::Attribute>());
-            assert(int_attr &&
-                   "Expected static tile sizes for intermediate buffer");
-            buffer_shape.push_back(int_attr.getInt());
-          }
-
-          PrivateResourceSpec* buffer_spec =
-              plan->resource_factory.createMemoryBuffer(
-                  intermediate_resource, buffer_shape, element_type);
-
-          // Use a dummy edge when no direct edge exists between resources
-          // (e.g. when an LS node sits between them in the routing graph).
-          scheduler::arch_view::RoutingGraph::NodeId src_node_id =
-              arch_graph.getNodeIdForResource(intermediate_is_source
-                                                  ? intermediate_resource
-                                                  : stage_info.stage_resource);
-          scheduler::arch_view::RoutingGraph::NodeId dst_node_id =
-              arch_graph.getNodeIdForResource(intermediate_is_source
-                                                  ? stage_info.stage_resource
-                                                  : intermediate_resource);
-          auto edge_opt = arch_graph.getEdgeInfo(src_node_id, dst_node_id);
-          scheduler::arch_view::RoutingGraph::EdgeInfo edge{src_node_id,
-                                                            dst_node_id, 1};
-          if (edge_opt) edge = *edge_opt;
-
-          mlir::OpBuilder builder(template_op->getContext());
-          TransferMaterializationInfo* transfer_info =
-              plan->transfer_factory.createFromTemplateWithBuffer(
-                  template_op, edge, intermediate_resource,
-                  stage_info.stage_resource, intermediate_is_source,
-                  buffer_spec, builder);
-
-          stage_info.transfers.push_back(transfer_info);
-          stage_info.kind = StageMaterializationInfo::Kind::kAdaptTransfer;
-          links[transfer_info] = {current_stage, neighbour, fifo_slot,
-                                  /*writes_to_hop=*/!intermediate_is_source};
-        };
-
-    // Indirect transfer: dir_dst (gather) or dir_src (scatter) is the FIFO
-    // slot that gets replaced by the L1 staging buffer.
-    // Run this walk first so the stage is classified before the DataTransferOp
-    // walk below, preventing double-classification when both op types coexist.
-    stage_op.walk([&](mlir::ktdf::IndDataTransferOp ind_transfer) {
-      bool is_gather = ind_transfer.isGather();
-      mlir::Value fifo_side =
-          is_gather ? ind_transfer.getDirDst() : ind_transfer.getDirSrc();
-      auto fifo_slot_type =
-          mlir::dyn_cast<mlir::ktdf::FifoSlotType>(fifo_side.getType());
-      if (!fifo_slot_type) {
-        ind_transfer.emitError("expected FifoSlotType on ")
-            << (is_gather ? "dir_dst" : "dir_src") << " of IndDataTransferOp";
-        return mlir::WalkResult::advance();
-      }
-      llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
-          is_gather ? ind_transfer.getMixedDirDstSizes()
-                    : ind_transfer.getMixedDirSrcSizes();
-
-      classifyTransferStage(ind_transfer.getOperation(),
-                            fifo_slot_type.getElementType(), tile_sizes,
-                            fifo_side, /*intermediate_is_source=*/!is_gather);
-      return mlir::WalkResult::advance();
-    });
-
-    // Direct transfer: exactly one side is a memref (the other is a FIFO).
-    // The IBR-fill DataTransferOp (both sides memref) is skipped by the guard.
-    // Skip entirely if an IndDataTransferOp already classified this stage.
-    if (stage_info.kind != StageMaterializationInfo::Kind::kAdaptTransfer) {
-      stage_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
-        mlir::Type src_type = transfer.getSource().getType();
-        mlir::Type dest_type = transfer.getDestination().getType();
-
-        bool src_is_memref = mlir::isa<mlir::MemRefType>(src_type);
-        bool dest_is_memref = mlir::isa<mlir::MemRefType>(dest_type);
-
-        if (src_is_memref == dest_is_memref) return mlir::WalkResult::advance();
-
-        mlir::MemRefType memref_type =
-            src_is_memref ? mlir::cast<mlir::MemRefType>(src_type)
-                          : mlir::cast<mlir::MemRefType>(dest_type);
-        llvm::SmallVector<mlir::OpFoldResult> tile_sizes =
-            src_is_memref ? transfer.getMixedSourceSizes()
-                          : transfer.getMixedDestSizes();
-        mlir::Value fifo_side =
-            src_is_memref ? transfer.getDestination() : transfer.getSource();
-
-        classifyTransferStage(transfer.getOperation(),
-                              memref_type.getElementType(), tile_sizes,
-                              fifo_side,
-                              /*intermediate_is_source=*/!src_is_memref);
-        return mlir::WalkResult::advance();
-      });
-    }
-
-    // --- Compute stage (kAdaptFifoKinds): read_from_fifo / write_to_fifo ---
-    stage_op.walk([&](mlir::Operation* op) {
-      auto read_op = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(op);
-      auto write_op = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(op);
-      if (!read_op && !write_op) return mlir::WalkResult::advance();
-
-      bool is_read = (read_op != nullptr);
-      mlir::Value fifo_slot =
-          is_read ? read_op.getFifoSlot() : write_op.getFifoSlot();
-      auto fifo_slot_type =
-          mlir::cast<mlir::ktdf::FifoSlotType>(fifo_slot.getType());
-
-      StageNode* adjacent_stage =
-          hopNeighbour(fifo_slot, /*stage_reads=*/is_read);
-      if (!adjacent_stage) return mlir::WalkResult::advance();
-
-      // fifo_src = applicable_unit of the adjacent LS-unit stage (load side)
-      // fifo_dest = applicable_unit of the adjacent LS-unit stage (store side)
-      // For read (consuming from left): src = adjacent.applicable_unit,
-      //   dest = stage.stage_resource
-      // For write (producing to right): src = stage.stage_resource,
-      //   dest = adjacent.applicable_unit
-      const StageMaterializationInfo& adj_info =
-          plan->getStageInfo(adjacent_stage);
-
-      // For read (consuming from left): src = adjacent.applicable_unit,
-      //   dest = stage.stage_resource
-      // For write (producing to right): src = stage.stage_resource,
-      //   dest = adjacent.applicable_unit
-      ResourceType fifo_src = is_read
-                                  ? adj_info.applicable_unit.value_or(nullptr)
-                                  : stage_info.stage_resource;
-      ResourceType fifo_dest = is_read
-                                   ? stage_info.stage_resource
-                                   : adj_info.applicable_unit.value_or(nullptr);
-      assert(fifo_src && fifo_dest &&
-             "Expected valid FIFO endpoint attributes");
-
-      mlir::Type element_type = fifo_slot_type.getElementType();
-      assert(!fifo_slot_type.isDynamicNumElements() &&
-             "Dynamic FIFO sizes not supported in path expansion");
-      int64_t num_elements = fifo_slot_type.getStaticNumElements();
-
-      mlir::OpResult alloc_result = getFifoAllocateResult(fifo_slot);
-      FifoKey fifo_key = {alloc_result ? alloc_result.getOwner() : nullptr,
-                          fifo_src, fifo_dest};
-      if (fifo_specs.find(fifo_key) == fifo_specs.end()) {
-        PrivateResourceSpec* spec = plan->resource_factory.createFifo(
-            fifo_src, fifo_dest, {num_elements}, element_type);
-        fifo_specs[fifo_key] = spec;
-        fifo_next_slot[fifo_key] = 0;
-      } else {
-        fifo_specs[fifo_key]->elements_per_slot.push_back(num_elements);
-      }
-
-      size_t slot_idx = fifo_next_slot[fifo_key]++;
-      validateFifoSlotIndex(fifo_slot, slot_idx, fifo_specs[fifo_key]);
-
-      // Use a dummy edge since the routing graph has no direct edge between
-      // stage_resource nodes (they go through LS-unit nodes).
-      scheduler::arch_view::RoutingGraph::NodeId src_node_id =
-          arch_graph.getNodeIdForResource(stage_info.stage_resource);
-      scheduler::arch_view::RoutingGraph::NodeId adj_node_id =
-          arch_graph.getNodeIdForResource(adj_info.stage_resource);
-      scheduler::arch_view::RoutingGraph::EdgeInfo edge{
-          is_read ? adj_node_id : src_node_id,
-          is_read ? src_node_id : adj_node_id, 1};
-
-      TransferMaterializationInfo* transfer_info =
-          plan->transfer_factory.createFromFifoOp(op, edge, fifo_src, fifo_dest,
-                                                  fifo_specs[fifo_key],
-                                                  slot_idx, is_read);
-
-      stage_info.transfers.push_back(transfer_info);
-      stage_info.kind = StageMaterializationInfo::Kind::kAdaptFifoKinds;
-      links[transfer_info] = {current_stage, adjacent_stage, fifo_slot,
-                              /*writes_to_hop=*/!is_read};
-
-      LDBG(1) << "  Stage " << current_stage->getStageId() << ": "
-              << (is_read ? "read_from_fifo" : "write_to_fifo")
-              << " - FIFO src=" << fifo_src << ", dest=" << fifo_dest
-              << ", slot " << slot_idx << ", elements=" << num_elements << "\n";
-
-      return mlir::WalkResult::advance();
-    });
-  }
-
-  return mlir::success();
+/// Return the shape of the data \p flow moves, for buffers and FIFOs between
+/// two hop stages. It comes from the data transfer at the producer end, or
+/// else at the consumer end. If both ends are FIFO ops, it is the size of the
+/// FIFO slot.
+static llvm::FailureOr<Tile> flowTile(const DataFlow& flow) {
+  auto isTransfer = [](mlir::Operation* op) {
+    return mlir::isa<mlir::ktdf::DataTransferOp, mlir::ktdf::IndDataTransferOp>(
+        op);
+  };
+  if (isTransfer(flow.producer_op))
+    return tileOf(flow.producer_op, /*replaces_source=*/false);
+  if (isTransfer(flow.consumer_op))
+    return tileOf(flow.consumer_op, /*replaces_source=*/true);
+  auto fifo_type = mlir::cast<mlir::ktdf::FifoSlotType>(flow.carrier.getType());
+  if (fifo_type.isDynamicNumElements()) return mlir::failure();
+  return Tile{{fifo_type.getStaticNumElements()}, fifo_type.getElementType()};
 }
 
-//===----------------------------------------------------------------------===//
-// Step 2b: Retype FIFOs Between Original Stages
-//===----------------------------------------------------------------------===//
+namespace {
+/// Creates the FIFOs that carry flows across boundaries.
+///
+/// The FIFOs of flows whose carrier is a FIFO slot are grouped like the
+/// original slots: slots of one fifo.allocate that cross the same pair of
+/// units go into one new fifo.allocate, in the same order. A flow whose
+/// carrier is a memref gets a FIFO of its own.
+class BoundaryFifos {
+ public:
+  explicit BoundaryFifos(PathExpansionPlan* plan) : plan_(plan) {}
+
+  /// Return the FIFO and slot that carry \p flow from \p src to \p dest. If
+  /// \p mirror_slot is set, the slot must have the same index as the
+  /// carrier's slot in its original fifo.allocate.
+  std::pair<PrivateResourceSpec*, size_t> get(const DataFlow& flow,
+                                              ResourceType src,
+                                              ResourceType dest,
+                                              const Tile& tile,
+                                              bool mirror_slot) {
+    if (flow.carrierIsMemref())
+      return {plan_->resource_factory.createFifo(
+                  src, dest, {tile.numElements()}, tile.element_type),
+              0};
+
+    auto fifo_type =
+        mlir::cast<mlir::ktdf::FifoSlotType>(flow.carrier.getType());
+    assert(!fifo_type.isDynamicNumElements() &&
+           "Dynamic FIFO sizes not supported in path expansion");
+    int64_t num_elements = fifo_type.getStaticNumElements();
+    mlir::OpResult alloc_result = getFifoAllocateResult(flow.carrier);
+    Key key = {alloc_result ? alloc_result.getOwner() : nullptr, src, dest};
+    PrivateResourceSpec*& spec = specs_[key];
+    if (!spec)
+      spec = plan_->resource_factory.createFifo(src, dest, {num_elements},
+                                                fifo_type.getElementType());
+    else
+      spec->elements_per_slot.push_back(num_elements);
+    size_t slot = next_slot_[key]++;
+    if (mirror_slot) validateFifoSlotIndex(flow.carrier, slot, spec);
+    return {spec, slot};
+  }
+
+ private:
+  using Key = std::tuple<mlir::Operation*, mlir::Attribute, mlir::Attribute>;
+  PathExpansionPlan* plan_;
+  llvm::DenseMap<Key, PrivateResourceSpec*> specs_;
+  llvm::DenseMap<Key, size_t> next_slot_;
+};
+}  // namespace
 
 /// Return the transfer registered for \p op in \p info, or nullptr.
 static TransferMaterializationInfo* findTransferForOp(
@@ -1477,6 +1429,182 @@ static TransferMaterializationInfo* findTransferForOp(
     if (transfer->template_op == op) return transfer;
   return nullptr;
 }
+
+/// Record in \p carrier the side of \p transfer that faces a hop stage.
+static void recordCarrier(const TransferMaterializationInfo* transfer,
+                          bool source_side, Carrier& carrier) {
+  if (source_side) {
+    carrier = {transfer->source_private_resource, transfer->source_slot_index,
+               transfer->source_indices, transfer->source_sizes,
+               transfer->source_map};
+  } else {
+    carrier = {transfer->dest_private_resource, transfer->dest_slot_index,
+               transfer->dest_indices, transfer->dest_sizes,
+               transfer->dest_map};
+  }
+}
+
+/// Step 2: Make the ops at both ends of every flow that got hop stages
+/// exchange data with those hop stages, and record what carries the data
+/// across the first and the last boundary of each such flow.
+///
+/// The producer op must now write into the first hop stage and the consumer
+/// op must read from the last one. At each end, boundaryPlace() says what
+/// carries the data:
+///   - A buffer in the memory there. A data transfer then uses a new buffer
+///     in that memory instead of its original operand. If the carrier is a
+///     memref already in that memory, the op is left as it is and the hop
+///     stage uses the memref directly.
+///   - A FIFO between two units. A data transfer, read_from_fifo or
+///     write_to_fifo then uses a new FIFO between those units.
+/// A read_from_fifo or write_to_fifo cannot use a buffer, and an indirect
+/// transfer is only adapted to use a buffer; anything else fails.
+///
+/// An op may be an end of more than one flow, for example a data transfer
+/// that reads a memref from one stage and writes a FIFO to another. It gets
+/// one transfer, with each side adapted for its own flow.
+///
+/// How it works: walk the original stages in order, and the ops of each
+/// stage in order, indirect transfers first, then data transfers, then FIFO
+/// ops. Each op that is an end of a flow with hops is adapted. Walking in
+/// this order keeps the new buffers and FIFOs in a stable order.
+static mlir::LogicalResult adaptFlowEnds(
+    llvm::ArrayRef<StageNode*> expanded_stages,
+    llvm::MutableArrayRef<DataFlow> flows,
+    const scheduler::arch_view::RoutingGraph& arch_graph,
+    PathExpansionPlan* plan, BoundaryFifos& fifos) {
+  // The flow ends of every op: the flow, and whether the op is its producer.
+  llvm::DenseMap<mlir::Operation*,
+                 llvm::SmallVector<std::pair<DataFlow*, bool>, 2>>
+      op_ends;
+  for (DataFlow& flow : flows) {
+    if (flow.chain.empty()) continue;
+    flow.carriers.resize(flow.chain.size() + 1);
+    op_ends[flow.consumer_op].push_back({&flow, false});
+    op_ends[flow.producer_op].push_back({&flow, true});
+  }
+
+  // Adapt the side of \p op that faces a hop stage of \p flow.
+  auto adaptEnd = [&](StageNode* stage, mlir::Operation* op, DataFlow& flow,
+                      bool is_producer) -> mlir::LogicalResult {
+    StageMaterializationInfo& stage_info = plan->getStageInfo(stage);
+    size_t k = is_producer ? 0 : flow.chain.size();
+    // The op reads the carrier at the consumer end and writes it at the
+    // producer end.
+    bool source_side = !is_producer;
+    BoundaryPlace place = boundaryPlace(flow, k, arch_graph);
+    Carrier& carrier = flow.carriers[k];
+
+    // A memref already in the right memory is used as it is.
+    if (flow.carrierIsMemref() && place.memory &&
+        memrefMemorySpace(flow.carrier) == place.memory) {
+      auto transfer = mlir::cast<mlir::ktdf::DataTransferOp>(op);
+      mlir::AffineMapAttr map_attr =
+          source_side ? transfer.getSourceMapAttr() : transfer.getDestMapAttr();
+      mlir::OperandRange indices =
+          source_side ? transfer.getSourceIndices() : transfer.getDestIndices();
+      carrier.spec = plan->resource_factory.createExistingValue(flow.carrier);
+      carrier.indices.assign(indices.begin(), indices.end());
+      carrier.sizes = source_side ? transfer.getMixedSourceSizes()
+                                  : transfer.getMixedDestSizes();
+      carrier.map = map_attr ? map_attr.getValue() : mlir::AffineMap();
+      return mlir::success();
+    }
+
+    bool is_fifo_op =
+        mlir::isa<mlir::ktdf::ReadFromFifoOp, mlir::ktdf::WriteToFifoOp>(op);
+    bool is_ind = mlir::isa<mlir::ktdf::IndDataTransferOp>(op);
+    if ((is_fifo_op && place.memory) || (is_ind && !place.memory)) {
+      LDBG(1) << "Stage " << stage->getStageId() << ": cannot make "
+              << op->getName() << " exchange data with a hop stage through "
+              << (place.memory ? "memory " : "a FIFO from ")
+              << (place.memory ? place.memory : place.fifo_src);
+      return mlir::failure();
+    }
+
+    // The ends of the edge this transfer implements; only for debug output.
+    ResourceType here = stage_info.stage_resource;
+    ResourceType there = place.memory  ? place.memory
+                         : is_producer ? place.fifo_dest
+                                       : place.fifo_src;
+    ResourceType source_resource = is_producer ? here : there;
+    ResourceType dest_resource = is_producer ? there : here;
+    scheduler::arch_view::RoutingGraph::EdgeInfo edge{
+        flow.path[flow.boundaries[k] - 1], flow.path[flow.boundaries[k]], 1};
+
+    if (is_fifo_op) {
+      auto [spec, slot] = fifos.get(flow, place.fifo_src, place.fifo_dest,
+                                    Tile{}, /*mirror_slot=*/true);
+      TransferMaterializationInfo* transfer =
+          plan->transfer_factory.createFromFifoOp(op, edge, source_resource,
+                                                  dest_resource, spec, slot,
+                                                  /*is_read=*/source_side);
+      stage_info.transfers.push_back(transfer);
+      stage_info.kind = StageMaterializationInfo::Kind::kAdaptFifoKinds;
+      recordCarrier(transfer, source_side, carrier);
+      LDBG(1) << "  Stage " << stage->getStageId() << ": " << op->getName()
+              << " - FIFO src=" << place.fifo_src
+              << ", dest=" << place.fifo_dest << ", slot " << slot << "\n";
+      return mlir::success();
+    }
+
+    llvm::FailureOr<Tile> tile = tileOf(op, source_side);
+    if (mlir::failed(tile)) {
+      LDBG(1) << "Stage " << stage->getStageId()
+              << ": transfer has a dynamic size";
+      return mlir::failure();
+    }
+    PrivateResourceSpec* spec;
+    size_t slot = 0;
+    if (place.memory) {
+      spec = plan->resource_factory.createMemoryBuffer(
+          place.memory, tile->shape, tile->element_type);
+    } else {
+      std::tie(spec, slot) = fifos.get(flow, place.fifo_src, place.fifo_dest,
+                                       *tile, /*mirror_slot=*/true);
+    }
+
+    TransferMaterializationInfo* transfer = findTransferForOp(stage_info, op);
+    if (!transfer) {
+      transfer = plan->transfer_factory.createFromTemplate(
+          op, edge, source_resource, dest_resource);
+      stage_info.transfers.push_back(transfer);
+    }
+    mlir::OpBuilder builder(op->getContext());
+    plan->transfer_factory.retargetSide(transfer, source_side, spec, slot,
+                                        builder);
+    if (stage_info.kind == StageMaterializationInfo::Kind::kPreserveOriginal)
+      stage_info.kind = StageMaterializationInfo::Kind::kAdaptTransfer;
+    recordCarrier(transfer, source_side, carrier);
+    return mlir::success();
+  };
+
+  for (StageNode* stage : expanded_stages) {
+    if (isIntermediateStage(stage)) continue;
+    auto stage_op = mlir::cast<mlir::ktdf::StageOp>(stage->getOperation());
+
+    llvm::SmallVector<mlir::Operation*> ops;
+    stage_op.walk([&](mlir::ktdf::IndDataTransferOp op) { ops.push_back(op); });
+    stage_op.walk([&](mlir::ktdf::DataTransferOp op) { ops.push_back(op); });
+    stage_op.walk([&](mlir::Operation* op) {
+      if (mlir::isa<mlir::ktdf::ReadFromFifoOp, mlir::ktdf::WriteToFifoOp>(op))
+        ops.push_back(op);
+    });
+
+    for (mlir::Operation* op : ops) {
+      auto ends_it = op_ends.find(op);
+      if (ends_it == op_ends.end()) continue;
+      for (auto [flow, is_producer] : ends_it->second)
+        if (mlir::failed(adaptEnd(stage, op, *flow, is_producer)))
+          return mlir::failure();
+    }
+  }
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// Step 2b: Retype FIFOs Between Original Stages
+//===----------------------------------------------------------------------===//
 
 /// Return true if \p transfer replaces the FIFO operand of \p endpoint. A
 /// transfer on a DataTransferOp may only replace its memref side, in which
@@ -1682,135 +1810,92 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
 
 /// Step 3: Give each hop stage the transfers that move data through it.
 ///
-/// Step 2 adapted the original stages on either side of each hop stage, so
-/// one of them now writes into the hop stage's buffer or FIFO and the other
-/// reads from it. Here the hop stage gets the transfer in between: from what
-/// one side writes to what the other side reads. A new stage gets only these
-/// transfers. An original stage that took on a hop keeps its own body and
-/// gets these transfers as well.
+/// Step 2 recorded what carries each flow across its first boundary (out of
+/// the producer) and its last boundary (into the consumer). Here each hop
+/// stage on the flow's chain gets a transfer from the carrier before it to
+/// the carrier after it. A new stage gets only these transfers. An original
+/// stage that took on a hop keeps its own body and gets these transfers as
+/// well. A hop stage on several flows gets one transfer per flow.
 ///
-/// How it works: Step 2 recorded, for each adapted op, the hop stage it
-/// exchanges data with and the original FIFO slot it replaces. For each hop
-/// stage, every transfer that writes into it is paired with the transfer
-/// that reads the same FIFO slot from it. That pair gives the source and the
-/// destination of the new transfer. Matching on the FIFO slot keeps data
-/// apart when a hop stage carries data for several dependencies.
+/// When two hop stages are next to each other, nothing carries the data
+/// between them yet. boundaryPlace() says what should: a buffer in the memory
+/// there, or a FIFO between the two units. It is created here, with the
+/// shape of the data the flow moves (see flowTile).
 ///
-/// Fails if a write has no matching read or the other way around. That
-/// happens when two hop stages are next to each other on one dependency,
-/// which is not supported yet.
+/// How it works: walk the flows in order. For each flow with hops, create the
+/// carriers of its inner boundaries, then one transfer for each hop stage.
 static mlir::LogicalResult populateHopStageTransfers(
-    llvm::ArrayRef<StageNode*> expanded_stages, const EdgeChainMap& edge_chains,
-    const TransferLinkMap& links,
+    llvm::MutableArrayRef<DataFlow> flows,
     const scheduler::arch_view::RoutingGraph& arch_graph,
-    PathExpansionPlan* plan) {
-  LDBG(1) << "Populating hop stage transfers for " << expanded_stages.size()
-          << " stages";
+    PathExpansionPlan* plan, BoundaryFifos& fifos) {
+  for (DataFlow& flow : flows) {
+    if (flow.chain.empty()) continue;
+    mlir::Operation* context_op = flow.producer->getOperation();
+    mlir::OpBuilder builder(context_op->getContext());
 
-  llvm::SmallPtrSet<StageNode*, 8> hops;
-  for (const auto& [edge, chain] : edge_chains) hops.insert_range(chain);
-
-  for (StageNode* hop : expanded_stages) {
-    if (!hops.contains(hop)) continue;
-
-    StageMaterializationInfo& stage_info = plan->getStageInfo(hop);
-    LDBG(1) << "  Processing hop stage " << hop->getStageId()
-            << " (resource: " << stage_info.stage_resource << ")\n";
-
-    llvm::SmallVector<
-        const std::pair<const TransferMaterializationInfo*, TransferLink>*>
-        writes, reads;
-    for (const auto& entry : links) {
-      if (entry.second.hop != hop) continue;
-      (entry.second.writes_to_hop ? writes : reads).push_back(&entry);
-    }
-
-    if (writes.size() != reads.size()) {
-      LDBG(1) << "Hop stage " << hop->getStageId() << " has " << writes.size()
-              << " transfers into it but " << reads.size()
-              << " out of it; hop stages next to each other are not supported";
-      return mlir::failure();
-    }
-
-    for (const auto* write : writes) {
-      const TransferMaterializationInfo* prev_transfer = write->first;
-      const TransferLink& write_link = write->second;
-
-      auto read_it = llvm::find_if(reads, [&](const auto* read) {
-        return read->second.fifo_slot == write_link.fifo_slot;
-      });
-      if (read_it == reads.end()) {
-        LDBG(1) << "Hop stage " << hop->getStageId()
-                << " receives data that no stage reads from it";
+    // Carriers between two hop stages.
+    for (size_t k = 1; k < flow.chain.size(); ++k) {
+      llvm::FailureOr<Tile> tile = flowTile(flow);
+      if (mlir::failed(tile)) {
+        LDBG(1) << "Flow from stage " << flow.producer->getStageId()
+                << " to stage " << flow.consumer->getStageId()
+                << " moves data of a dynamic size";
         return mlir::failure();
       }
-      const TransferMaterializationInfo* next_transfer = (*read_it)->first;
-      StageNode* reader = (*read_it)->second.stage;
-
-      assert(prev_transfer->dest_private_resource &&
-             next_transfer->source_private_resource &&
-             "Transfers next to a hop stage should use its private resources");
-      const PrivateResourceSpec* source_resource_spec =
-          prev_transfer->dest_private_resource;
-      const PrivateResourceSpec* dest_resource_spec =
-          next_transfer->source_private_resource;
-
-      ResourceType inferred_source_resource =
-          plan->getStageInfo(write_link.stage).stage_resource;
-      ResourceType inferred_dest_resource =
-          plan->getStageInfo(reader).stage_resource;
-
-      // Build edge: use source/dest node IDs derived from adjacent stage
-      // resources
-      scheduler::arch_view::RoutingGraph::NodeId src_nid =
-          arch_graph.getNodeIdForResource(inferred_source_resource);
-      scheduler::arch_view::RoutingGraph::NodeId dst_nid =
-          arch_graph.getNodeIdForResource(inferred_dest_resource);
-      scheduler::arch_view::RoutingGraph::EdgeInfo edge{src_nid, dst_nid, 1};
-      // Try to find a real edge (may not exist if going through LS nodes)
-      if (auto real_edge = arch_graph.getEdgeInfo(src_nid, dst_nid))
-        edge = *real_edge;
-
-      mlir::MLIRContext* ctx = write_link.stage->getOperation()->getContext();
-      mlir::AffineMap source_map_for_intermediate = prev_transfer->dest_map;
-      if (!source_map_for_intermediate &&
-          source_resource_spec->kind ==
-              PrivateResourceSpec::Kind::kMemoryBuffer) {
-        source_map_for_intermediate =
-            createAffineMapForIntermediateBuffer(source_resource_spec, ctx);
+      BoundaryPlace place = boundaryPlace(flow, k, arch_graph);
+      Carrier& carrier = flow.carriers[k];
+      if (place.memory) {
+        carrier.spec = plan->resource_factory.createMemoryBuffer(
+            place.memory, tile->shape, tile->element_type);
+        carrier.slot_index = 0;
+      } else {
+        std::tie(carrier.spec, carrier.slot_index) =
+            fifos.get(flow, place.fifo_src, place.fifo_dest, *tile,
+                      /*mirror_slot=*/false);
       }
-
-      mlir::AffineMap dest_map_for_intermediate = next_transfer->source_map;
-      if (!dest_map_for_intermediate &&
-          dest_resource_spec->kind ==
-              PrivateResourceSpec::Kind::kMemoryBuffer) {
-        dest_map_for_intermediate =
-            createAffineMapForIntermediateBuffer(dest_resource_spec, ctx);
-      }
-
-      TransferMaterializationInfo* transfer_info =
-          plan->transfer_factory.createSynthetic(
-              edge, inferred_source_resource, inferred_dest_resource,
-              source_resource_spec, prev_transfer->dest_slot_index,
-              prev_transfer->dest_indices, prev_transfer->dest_sizes,
-              source_map_for_intermediate, dest_resource_spec,
-              next_transfer->source_slot_index, next_transfer->source_indices,
-              next_transfer->source_sizes, dest_map_for_intermediate, ctx);
-
-      stage_info.transfers.push_back(transfer_info);
-
-      LDBG(1) << "    Created transfer: " << inferred_source_resource << " -> "
-              << inferred_dest_resource << "\n";
+      TransferInfoFactory::describePrivateSide(
+          carrier.spec, carrier.slot_index, context_op, builder,
+          carrier.indices, carrier.sizes, carrier.map);
     }
 
-    if (writes.empty()) {
-      LDBG(1) << "Hop stage " << hop->getStageId()
-              << " has nothing to transfer; hop stages next to each other are "
-                 "not supported";
-      return mlir::failure();
+    for (size_t k = 0; k < flow.chain.size(); ++k) {
+      const Carrier& source = flow.carriers[k];
+      const Carrier& dest = flow.carriers[k + 1];
+      assert(source.spec && dest.spec &&
+             "Every boundary of a flow with hops should have a carrier");
+
+      // The stage ends this transfer connects; only for debug output.
+      auto source_node = arch_graph.getNode(flow.path[flow.boundaries[k] - 1]);
+      auto dest_node = arch_graph.getNode(flow.path[flow.boundaries[k + 1]]);
+      assert(source_node && dest_node && "node in path must exist in graph");
+      scheduler::arch_view::RoutingGraph::EdgeInfo edge{
+          flow.path[flow.boundaries[k] - 1], flow.path[flow.boundaries[k + 1]],
+          1};
+
+      mlir::AffineMap source_map = source.map;
+      if (!source_map && source.spec->kind != PrivateResourceSpec::Kind::kFifo)
+        source_map = createAffineMapForIntermediateBuffer(source.spec,
+                                                          builder.getContext());
+      mlir::AffineMap dest_map = dest.map;
+      if (!dest_map && dest.spec->kind != PrivateResourceSpec::Kind::kFifo)
+        dest_map = createAffineMapForIntermediateBuffer(dest.spec,
+                                                        builder.getContext());
+
+      TransferMaterializationInfo* transfer =
+          plan->transfer_factory.createSynthetic(
+              edge, source_node->resource, dest_node->resource, source.spec,
+              source.slot_index, source.indices, source.sizes, source_map,
+              dest.spec, dest.slot_index, dest.indices, dest.sizes, dest_map,
+              builder.getContext());
+      plan->getStageInfo(flow.chain[k]).transfers.push_back(transfer);
+
+      LDBG(1) << "  Stage " << flow.chain[k]->getStageId()
+              << ": created transfer " << source_node->resource << " -> "
+              << dest_node->resource << " for the flow from stage "
+              << flow.producer->getStageId() << " to stage "
+              << flow.consumer->getStageId() << "\n";
     }
   }
-
   return mlir::success();
 }
 
@@ -1829,12 +1914,12 @@ static void debugPrintInitialPlannerState(
   llvm::dbgs() << "\n\n";
 }
 
-static void debugPrintEdgeSegments(llvm::ArrayRef<EdgeSegment> segments) {
-  for (const EdgeSegment& seg : segments) {
-    llvm::dbgs() << "Path from stage " << seg.producer->getStageId()
-                 << " to stage " << seg.consumer->getStageId()
-                 << " (node IDs): ";
-    for (auto node_id : seg.path) llvm::dbgs() << node_id << " ";
+static void debugPrintDataFlows(llvm::ArrayRef<DataFlow> flows) {
+  for (const DataFlow& flow : flows) {
+    llvm::dbgs() << "Flow from stage " << flow.producer->getStageId()
+                 << " to stage " << flow.consumer->getStageId() << " via "
+                 << flow.carrier.getType() << ", path (node IDs): ";
+    for (auto node_id : flow.path) llvm::dbgs() << node_id << " ";
     llvm::dbgs() << "\n";
   }
 }
@@ -1855,16 +1940,21 @@ static void debugPrintPlanningSummary(
 /// here; the materializer does that afterwards from the tree and the plan.
 static mlir::LogicalResult buildExpansionPlan(
     PipelineTree& tree, PipelineNode* pipeline,
-    llvm::ArrayRef<EdgeSegment> segments,
+    llvm::MutableArrayRef<DataFlow> flows, const FifoEndpoints& fifo_endpoints,
     llvm::ArrayRef<StageNode*> sorted_stages,
     const scheduler::arch_view::RoutingGraph& arch_graph,
     PathExpansionPlan* plan, int& next_stage_id) {
-  // STEP 1: Add hop stages along each dependency
+  if (fifo_endpoints.duplicate) {
+    auto [op, is_producer] = *fifo_endpoints.duplicate;
+    op->emitError("path-expansion: FIFO slot has more than one ")
+        << (is_producer ? "producer" : "consumer");
+    return mlir::failure();
+  }
+
+  // STEP 1: Add hop stages along each flow
   LDBG(1) << "\n=== Step 1: Add Stages Along Each Path ===\n";
-  EdgeChainMap edge_chains;
-  if (mlir::failed(expandStageEdges(tree, pipeline, segments, sorted_stages,
-                                    arch_graph, plan, next_stage_id,
-                                    edge_chains))) {
+  if (mlir::failed(expandDataFlows(tree, pipeline, flows, sorted_stages,
+                                   arch_graph, plan, next_stage_id))) {
     return mlir::failure();
   }
   if (mlir::failed(orderStagesByDependencies(pipeline))) {
@@ -1888,22 +1978,15 @@ static mlir::LogicalResult buildExpansionPlan(
       return mlir::failure();
     }
   }
-  StagePredecessorMap preds = buildPredecessorMap(expanded_stages);
   LDBG_OS(1, [&](llvm::raw_ostream& os) {
     debugPrintStageList(os, expanded_stages, plan, "After Step 1");
   });
 
-  FifoEndpoints fifo_endpoints;
-  if (mlir::failed(collectFifoEndpoints(sorted_stages, fifo_endpoints))) {
-    return mlir::failure();
-  }
-
-  // STEP 2: Classify original stages and create private resources
-  LDBG(1) << "\n=== Step 2: Classify Original Stages ===\n";
-  TransferLinkMap links;
-  if (mlir::failed(classifyOriginalStages(expanded_stages, preds,
-                                          fifo_endpoints, edge_chains,
-                                          arch_graph, plan, links))) {
+  // STEP 2: Adapt the ops at both ends of each flow that got hops
+  LDBG(1) << "\n=== Step 2: Adapt the Ends of Each Flow ===\n";
+  BoundaryFifos fifos(plan);
+  if (mlir::failed(
+          adaptFlowEnds(expanded_stages, flows, arch_graph, plan, fifos))) {
     return mlir::failure();
   }
   LDBG_OS(1, [&](llvm::raw_ostream& os) {
@@ -1922,8 +2005,7 @@ static mlir::LogicalResult buildExpansionPlan(
 
   // STEP 3: Populate hop stage transfers
   LDBG(1) << "\n=== Step 3: Populate Hop Stage Transfers ===\n";
-  if (mlir::failed(populateHopStageTransfers(expanded_stages, edge_chains,
-                                             links, arch_graph, plan))) {
+  if (mlir::failed(populateHopStageTransfers(flows, arch_graph, plan, fifos))) {
     return mlir::failure();
   }
   LDBG_OS(1, [&](llvm::raw_ostream& os) {
@@ -1958,25 +2040,24 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
     return nullptr;
   }
 
-  // PREP 3: Find the routing path for every dependency between stages
-  llvm::FailureOr<llvm::SmallVector<EdgeSegment>> segments_or =
-      buildEdgeSegments(sorted_stages, sides, arch_graph, plan.get());
-  if (mlir::failed(segments_or)) {
+  // PREP 3: Find the data passed between stages and the route of each
+  FifoEndpoints fifo_endpoints = collectFifoEndpoints(sorted_stages);
+  std::vector<DataFlow> flows = collectDataFlows(sorted_stages, fifo_endpoints);
+  if (mlir::failed(routeDataFlows(flows, sides, arch_graph, plan.get()))) {
     LDBG(1) << "No resource path found\n";
     return nullptr;
   }
-  llvm::SmallVector<EdgeSegment> segments = std::move(*segments_or);
 
-  LLVM_DEBUG(debugPrintEdgeSegments(segments));
+  LLVM_DEBUG(debugPrintDataFlows(flows));
 
   // PREP 4: Assign units to the original stages; each must get its own
-  if (mlir::failed(assignOriginalStageUnits(segments, sorted_stages, arch_graph,
+  if (mlir::failed(assignOriginalStageUnits(flows, sorted_stages, arch_graph,
                                             plan.get()))) {
     return nullptr;
   }
 
   // PREP 5: Check whether path expansion is needed
-  if (!needsExpansion(segments, arch_graph)) {
+  if (!needsExpansion(flows, arch_graph)) {
     plan->changed = false;
     LDBG(1) << "Pipeline already legal";
     return plan;
@@ -1985,8 +2066,9 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
   plan->changed = true;
 
   int next_stage_id = static_cast<int>(sorted_stages.size());
-  if (mlir::failed(buildExpansionPlan(tree, pipeline, segments, sorted_stages,
-                                      arch_graph, plan.get(), next_stage_id))) {
+  if (mlir::failed(buildExpansionPlan(tree, pipeline, flows, fifo_endpoints,
+                                      sorted_stages, arch_graph, plan.get(),
+                                      next_stage_id))) {
     return nullptr;
   }
 

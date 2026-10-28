@@ -123,6 +123,23 @@ PrivateResourceSpec* PrivateResourceFactory::createFifo(
   return ptr;
 }
 
+PrivateResourceSpec* PrivateResourceFactory::createExistingValue(
+    mlir::Value value) {
+  auto memref_type = mlir::cast<mlir::MemRefType>(value.getType());
+  auto spec = std::make_unique<PrivateResourceSpec>();
+  spec->kind = PrivateResourceSpec::Kind::kExistingValue;
+  spec->existing_value = value;
+  spec->memory_resource =
+      llvm::cast<ResourceType>(memref_type.getMemorySpace());
+  spec->shape.assign(memref_type.getShape().begin(),
+                     memref_type.getShape().end());
+  spec->element_type = memref_type.getElementType();
+
+  PrivateResourceSpec* ptr = spec.get();
+  specs_.push_back(std::move(spec));
+  return ptr;
+}
+
 void PrivateResourceFactory::registerAllocation(
     const PrivateResourceSpec* spec, llvm::ArrayRef<mlir::Value> ssa_values) {
   auto alloc = std::make_unique<PrivateResourceAllocation>(spec);
@@ -187,67 +204,58 @@ static TemplateTransferSides extractTemplateSides(mlir::Operation* op) {
 }
 }  // namespace
 
-TransferMaterializationInfo* TransferInfoFactory::createFromTemplateWithBuffer(
-    mlir::Operation* template_op,
-    const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
-    ResourceType intermediate_resource, ResourceType current_resource,
-    bool intermediate_is_source, const PrivateResourceSpec* buffer_spec,
-    mlir::OpBuilder& builder) {
-  assert((mlir::isa<mlir::ktdf::DataTransferOp>(template_op) ||
-          mlir::isa<mlir::ktdf::IndDataTransferOp>(template_op)) &&
-         "template_op must be a DataTransferOp or IndDataTransferOp");
+void TransferInfoFactory::describePrivateSide(
+    const PrivateResourceSpec* spec, size_t slot_index,
+    mlir::Operation* context_op, mlir::OpBuilder& builder,
+    llvm::SmallVectorImpl<mlir::Value>& indices,
+    llvm::SmallVectorImpl<mlir::OpFoldResult>& sizes, mlir::AffineMap& map) {
+  indices.clear();
+  sizes.clear();
+  map = {};
+  deriveSizesFromResourceSpec(spec, slot_index, builder.getContext(), sizes);
+  if (spec->kind != PrivateResourceSpec::Kind::kMemoryBuffer) return;
+  createIndicesForIntermediateBuffer(spec, context_op, builder, indices);
+  map = createAffineMapForIntermediateBuffer(spec, builder.getContext());
+}
 
-  auto sides = extractTemplateSides(template_op);
+void TransferInfoFactory::retargetSide(TransferMaterializationInfo* transfer,
+                                       bool source_side,
+                                       const PrivateResourceSpec* spec,
+                                       size_t slot_index,
+                                       mlir::OpBuilder& builder) {
+  (source_side ? transfer->source_private_resource
+               : transfer->dest_private_resource) = spec;
+  (source_side ? transfer->source_slot_index : transfer->dest_slot_index) =
+      slot_index;
 
-  auto transfer = std::make_unique<TransferMaterializationInfo>();
-  transfer->template_op = template_op;
-  transfer->hop = edge;
-  transfer->source_resource =
-      intermediate_is_source ? intermediate_resource : current_resource;
-  transfer->dest_resource =
-      intermediate_is_source ? current_resource : intermediate_resource;
+  // A FIFO operand replaced by another FIFO keeps its indices and sizes.
+  mlir::Operation* op = transfer->template_op;
+  mlir::Value operand;
+  if (auto dt = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op))
+    operand = source_side ? dt.getSource() : dt.getDestination();
+  else
+    operand = source_side
+                  ? mlir::cast<mlir::ktdf::IndDataTransferOp>(op).getDirSrc()
+                  : mlir::cast<mlir::ktdf::IndDataTransferOp>(op).getDirDst();
+  if (spec->kind == PrivateResourceSpec::Kind::kFifo &&
+      mlir::isa<mlir::ktdf::FifoSlotType>(operand.getType()))
+    return;
 
-  if (intermediate_is_source) {
-    // Source is the intermediate buffer; dest side comes from the template.
-    transfer->source_private_resource = buffer_spec;
-    createIndicesForIntermediateBuffer(buffer_spec, template_op, builder,
-                                       transfer->source_indices);
-    deriveSizesFromResourceSpec(buffer_spec, 0, builder.getContext(),
-                                transfer->source_sizes);
-    transfer->source_map =
-        createAffineMapForIntermediateBuffer(buffer_spec, builder.getContext());
-    // Dest: copy indices, sizes, and map from template (may be memref or FIFO;
-    // map is null for FIFO, affine map for memref).
-    transfer->dest_indices = sides.dst_indices;
-    transfer->dest_sizes = sides.dst_sizes;
-    transfer->dest_map = sides.dst_map;
-  } else {
-    // Dest is the intermediate buffer; source side comes from the template.
-    transfer->dest_private_resource = buffer_spec;
-    // Source: copy indices, sizes, and map from template (may be memref or
-    // FIFO; map is null for FIFO, affine map for memref).
-    transfer->source_indices = sides.src_indices;
-    transfer->source_sizes = sides.src_sizes;
-    transfer->source_map = sides.src_map;
-    createIndicesForIntermediateBuffer(buffer_spec, template_op, builder,
-                                       transfer->dest_indices);
-    deriveSizesFromResourceSpec(buffer_spec, 0, builder.getContext(),
-                                transfer->dest_sizes);
-    transfer->dest_map =
-        createAffineMapForIntermediateBuffer(buffer_spec, builder.getContext());
-  }
-
-  TransferMaterializationInfo* result = transfer.get();
-  transfers_.push_back(std::move(transfer));
-  return result;
+  if (source_side)
+    describePrivateSide(spec, slot_index, op, builder, transfer->source_indices,
+                        transfer->source_sizes, transfer->source_map);
+  else
+    describePrivateSide(spec, slot_index, op, builder, transfer->dest_indices,
+                        transfer->dest_sizes, transfer->dest_map);
 }
 
 TransferMaterializationInfo* TransferInfoFactory::createFromTemplate(
     mlir::Operation* template_op,
     const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
     ResourceType source_resource, ResourceType dest_resource) {
-  assert(mlir::isa<mlir::ktdf::DataTransferOp>(template_op) &&
-         "template_op must be a DataTransferOp");
+  assert((mlir::isa<mlir::ktdf::DataTransferOp>(template_op) ||
+          mlir::isa<mlir::ktdf::IndDataTransferOp>(template_op)) &&
+         "template_op must be a DataTransferOp or IndDataTransferOp");
 
   auto sides = extractTemplateSides(template_op);
 
