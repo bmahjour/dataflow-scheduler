@@ -162,14 +162,14 @@ void PrivateResourceSpec::dump() const {
 void TransferMaterializationInfo::print(llvm::raw_ostream& os) const {
   os << "Transfer(" << source_resource << " -> " << dest_resource;
 
-  if (source_private_resource) {
+  if (source.resource) {
     os << ", priv_source=";
-    source_private_resource->print(os);
+    source.resource->print(os);
   }
 
-  if (dest_private_resource) {
+  if (dest.resource) {
     os << ", priv_dest=";
-    dest_private_resource->print(os);
+    dest.resource->print(os);
   }
 
   if (template_op) {
@@ -190,20 +190,20 @@ void TransferMaterializationInfo::dump() const {
 void TransferMaterializationInfo::printDebug(llvm::raw_ostream& os) const {
   os << source_resource << " -> " << dest_resource;
 
-  if (source_private_resource) {
+  if (source.resource) {
     os << " (source: ";
-    if (source_private_resource->kind == PrivateResourceSpec::Kind::kFifo) {
-      os << "FIFO slot " << source_slot_index;
+    if (source.resource->kind == PrivateResourceSpec::Kind::kFifo) {
+      os << "FIFO slot " << source.slot_index;
     } else {
       os << "buffer";
     }
     os << ")";
   }
 
-  if (dest_private_resource) {
+  if (dest.resource) {
     os << " (dest: ";
-    if (dest_private_resource->kind == PrivateResourceSpec::Kind::kFifo) {
-      os << "FIFO slot " << dest_slot_index;
+    if (dest.resource->kind == PrivateResourceSpec::Kind::kFifo) {
+      os << "FIFO slot " << dest.slot_index;
     } else {
       os << "buffer";
     }
@@ -740,13 +740,7 @@ static mlir::OpResult getFifoAllocateResult(mlir::Value fifo_slot) {
 namespace {
 /// What holds a flow's data at one boundary (see DataFlow): a buffer, FIFO
 /// slot or original memref, and how a transfer addresses it.
-struct Carrier {
-  const PrivateResourceSpec* spec = nullptr;
-  size_t slot_index = 0;
-  llvm::SmallVector<mlir::Value> indices;
-  llvm::SmallVector<mlir::OpFoldResult> sizes;
-  mlir::AffineMap map;
-};
+using Carrier = TransferSide;
 
 /// Data that one original stage passes to another, and the route it takes.
 ///
@@ -1441,20 +1435,6 @@ static TransferMaterializationInfo* findTransferForOp(
   return nullptr;
 }
 
-/// Record in \p carrier the side of \p transfer that faces a hop stage.
-static void recordCarrier(const TransferMaterializationInfo* transfer,
-                          bool source_side, Carrier& carrier) {
-  if (source_side) {
-    carrier = {transfer->source_private_resource, transfer->source_slot_index,
-               transfer->source_indices, transfer->source_sizes,
-               transfer->source_map};
-  } else {
-    carrier = {transfer->dest_private_resource, transfer->dest_slot_index,
-               transfer->dest_indices, transfer->dest_sizes,
-               transfer->dest_map};
-  }
-}
-
 /// Step 2: Make the ops at both ends of every flow that got hop stages
 /// exchange data with those hop stages, and record what carries the data
 /// across the first and the last boundary of each such flow.
@@ -1508,16 +1488,9 @@ static mlir::LogicalResult adaptFlowEnds(
     // A memref already in the right memory is used as it is.
     if (flow.carrierIsMemref() && place.memory &&
         memrefMemorySpace(flow.carrier) == place.memory) {
-      auto transfer = mlir::cast<mlir::ktdf::DataTransferOp>(op);
-      mlir::AffineMapAttr map_attr =
-          source_side ? transfer.getSourceMapAttr() : transfer.getDestMapAttr();
-      mlir::OperandRange indices =
-          source_side ? transfer.getSourceIndices() : transfer.getDestIndices();
-      carrier.spec = plan->resource_factory.createExistingValue(flow.carrier);
-      carrier.indices.assign(indices.begin(), indices.end());
-      carrier.sizes = source_side ? transfer.getMixedSourceSizes()
-                                  : transfer.getMixedDestSizes();
-      carrier.map = map_attr ? map_attr.getValue() : mlir::AffineMap();
+      carrier = TransferInfoFactory::describeTemplateSide(op, source_side);
+      carrier.resource =
+          plan->resource_factory.createExistingValue(flow.carrier);
       return mlir::success();
     }
 
@@ -1551,7 +1524,7 @@ static mlir::LogicalResult adaptFlowEnds(
                                                   /*is_read=*/source_side);
       stage_info.transfers.push_back(transfer);
       stage_info.kind = StageMaterializationInfo::Kind::kAdaptFifoKinds;
-      recordCarrier(transfer, source_side, carrier);
+      carrier = transfer->side(source_side);
       LDBG(1) << "  Stage " << stage->getStageId() << ": " << op->getName()
               << " - FIFO src=" << place.fifo_src
               << ", dest=" << place.fifo_dest << ", slot " << slot << "\n";
@@ -1585,7 +1558,7 @@ static mlir::LogicalResult adaptFlowEnds(
                                         builder);
     if (stage_info.kind == StageMaterializationInfo::Kind::kPreserveOriginal)
       stage_info.kind = StageMaterializationInfo::Kind::kAdaptTransfer;
-    recordCarrier(transfer, source_side, carrier);
+    carrier = transfer->side(source_side);
     return mlir::success();
   };
 
@@ -1622,8 +1595,7 @@ static mlir::LogicalResult adaptFlowEnds(
 static bool transferRewritesFifo(const TransferMaterializationInfo* transfer,
                                  const FifoEndpoint& endpoint) {
   if (!transfer) return false;
-  return endpoint.fifo_is_source ? transfer->source_private_resource != nullptr
-                                 : transfer->dest_private_resource != nullptr;
+  return transfer->side(endpoint.fifo_is_source).resource != nullptr;
 }
 
 /// Step 2b: Step 2 only rewrites FIFOs that touch a synthetic stage. A FIFO
@@ -1782,13 +1754,9 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
                         fifo_spec, slot.slot_idx, /*is_read=*/is_consumer);
           info.transfers.push_back(transfer);
         }
-        if (is_consumer) {
-          transfer->source_private_resource = fifo_spec;
-          transfer->source_slot_index = slot.slot_idx;
-        } else {
-          transfer->dest_private_resource = fifo_spec;
-          transfer->dest_slot_index = slot.slot_idx;
-        }
+        TransferSide& fifo_side = transfer->side(/*source_side=*/is_consumer);
+        fifo_side.resource = fifo_spec;
+        fifo_side.slot_index = slot.slot_idx;
 
         // The materializer only rewrites read_from_fifo / write_to_fifo in
         // kAdaptFifoKinds stages; DataTransferOps are rewritten in either
@@ -1850,25 +1818,22 @@ static mlir::LogicalResult populateHopStageTransfers(
     }
     for (size_t k = 1; k < flow.chain.size(); ++k) {
       BoundaryPlace place = boundaryPlace(flow, k, arch_graph);
-      Carrier& carrier = flow.carriers[k];
-      if (place.memory) {
-        carrier.spec = plan->resource_factory.createMemoryBuffer(
+      PrivateResourceSpec* spec;
+      size_t slot = 0;
+      if (place.memory)
+        spec = plan->resource_factory.createMemoryBuffer(
             place.memory, tile->shape, tile->element_type);
-        carrier.slot_index = 0;
-      } else {
-        std::tie(carrier.spec, carrier.slot_index) =
-            fifos.get(flow, place.fifo_src, place.fifo_dest, *tile,
-                      /*mirror_slot=*/false);
-      }
-      TransferInfoFactory::describePrivateSide(
-          carrier.spec, carrier.slot_index, context_op, builder,
-          carrier.indices, carrier.sizes, carrier.map);
+      else
+        std::tie(spec, slot) = fifos.get(flow, place.fifo_src, place.fifo_dest,
+                                         *tile, /*mirror_slot=*/false);
+      flow.carriers[k] = TransferInfoFactory::describePrivateSide(
+          spec, slot, context_op, builder);
     }
 
     for (size_t k = 0; k < flow.chain.size(); ++k) {
       const Carrier& source = flow.carriers[k];
       const Carrier& dest = flow.carriers[k + 1];
-      assert(source.spec && dest.spec &&
+      assert(source.resource && dest.resource &&
              "Every boundary of a flow with hops should have a carrier");
 
       // The stage ends this transfer connects; only for debug output.
@@ -1881,23 +1846,10 @@ static mlir::LogicalResult populateHopStageTransfers(
       RoutingGraph::EdgeInfo edge{flow.path[source_idx], flow.path[dest_idx],
                                   1};
 
-      // A buffer without a map is accessed with the identity map.
-      auto mapFor = [&](const Carrier& carrier) {
-        if (carrier.map ||
-            carrier.spec->kind == PrivateResourceSpec::Kind::kFifo)
-          return carrier.map;
-        return mlir::AffineMap::getMultiDimIdentityMap(
-            carrier.spec->shape.size(), builder.getContext());
-      };
-      mlir::AffineMap source_map = mapFor(source);
-      mlir::AffineMap dest_map = mapFor(dest);
-
       TransferMaterializationInfo* transfer =
-          plan->transfer_factory.createSynthetic(
-              edge, source_node.resource, dest_node.resource, source.spec,
-              source.slot_index, source.indices, source.sizes, source_map,
-              dest.spec, dest.slot_index, dest.indices, dest.sizes, dest_map,
-              builder.getContext());
+          plan->transfer_factory.createSynthetic(edge, source_node.resource,
+                                                 dest_node.resource, source,
+                                                 dest, builder.getContext());
       plan->getStageInfo(flow.chain[k]).transfers.push_back(transfer);
 
       LDBG(1) << "  Stage " << flow.chain[k]->getStageId()

@@ -52,6 +52,7 @@ namespace scheduler {
 struct PrivateResourceSpec;
 struct PrivateResourceAllocation;
 struct TransferMaterializationInfo;
+struct TransferSide;
 
 //===----------------------------------------------------------------------===//
 // PrivateResourceFactory
@@ -152,11 +153,16 @@ class TransferInfoFactory {
   /// indices, the full shape and an identity map for a buffer; only the
   /// slot's size for a FIFO. Zero indices are created as constants at the
   /// start of the function containing \p context_op.
-  static void describePrivateSide(
-      const PrivateResourceSpec* spec, size_t slot_index,
-      mlir::Operation* context_op, mlir::OpBuilder& builder,
-      llvm::SmallVectorImpl<mlir::Value>& indices,
-      llvm::SmallVectorImpl<mlir::OpFoldResult>& sizes, mlir::AffineMap& map);
+  static TransferSide describePrivateSide(const PrivateResourceSpec* spec,
+                                          size_t slot_index,
+                                          mlir::Operation* context_op,
+                                          mlir::OpBuilder& builder);
+
+  /// Return how \p op, a DataTransferOp or IndDataTransferOp, addresses its
+  /// source (if \p source_side) or its destination: the op's own indices,
+  /// sizes and map. The returned side has no private resource.
+  static TransferSide describeTemplateSide(mlir::Operation* op,
+                                           bool source_side);
 
   /// Create transfer for FIFO operation
   /// Used when adapting FIFO read/write operations to work with path expansion
@@ -174,32 +180,18 @@ class TransferInfoFactory {
       ResourceType source_resource, ResourceType dest_resource,
       const PrivateResourceSpec* fifo_spec, size_t slot_index, bool is_read);
 
-  /// Create synthetic transfer for intermediate stage
-  /// Used when creating new transfer operations for intermediate stages
+  /// Create a transfer, with no template op, that moves data from \p source
+  /// to \p dest. Both sides must have a private resource. A side with no
+  /// sizes moves the whole buffer or FIFO slot, and a buffer side with no map
+  /// is addressed with the identity map.
   /// @param edge The architecture edge this transfer implements
   /// @param source_resource The source resource
   /// @param dest_resource The destination resource
-  /// @param source_spec The source private resource spec
-  /// @param source_slot_index The source slot index
-  /// @param source_indices The source indices
-  /// @param source_sizes The source sizes
-  /// @param source_map The source affine map (from neighboring transfer)
-  /// @param dest_spec The destination private resource spec
-  /// @param dest_slot_index The destination slot index
-  /// @param dest_indices The destination indices
-  /// @param dest_sizes The destination sizes
-  /// @param dest_map The destination affine map (from neighboring transfer)
-  /// @param context MLIR context for creating attributes
   /// @return Pointer to created transfer info (owned by factory)
   TransferMaterializationInfo* createSynthetic(
       const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
       ResourceType source_resource, ResourceType dest_resource,
-      const PrivateResourceSpec* source_spec, size_t source_slot_index,
-      llvm::ArrayRef<mlir::Value> source_indices,
-      llvm::ArrayRef<mlir::OpFoldResult> source_sizes,
-      mlir::AffineMap source_map, const PrivateResourceSpec* dest_spec,
-      size_t dest_slot_index, llvm::ArrayRef<mlir::Value> dest_indices,
-      llvm::ArrayRef<mlir::OpFoldResult> dest_sizes, mlir::AffineMap dest_map,
+      const TransferSide& source, const TransferSide& dest,
       mlir::MLIRContext* context);
 
  private:
