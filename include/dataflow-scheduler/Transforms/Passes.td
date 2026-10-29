@@ -682,8 +682,9 @@ def FoldFifoRelayStagesPass
     - The applicable units of the stages intersect, if both have any.
 
     The target is the stage whose fold leaves the other one empty if there is
-    one, then the producer, then the consumer. Stages are reordered afterwards
-    so that each comes after the stages it awaits.
+    one, then the producer, then the consumer. Afterwards, stages are reordered
+    so that each comes after the stages it awaits, and the dependency tokens
+    are normalized (see `simplify-pipeline`).
 
     Example:
     ```mlir

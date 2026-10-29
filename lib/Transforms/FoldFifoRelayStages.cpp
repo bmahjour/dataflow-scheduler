@@ -17,7 +17,6 @@
 //===----------------------------------------------------------------------===//
 
 #include <llvm/ADT/STLExtras.h>
-#include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/DebugLog.h>
 #include <mlir/Dialect/Utils/StaticValueUtils.h>
@@ -28,7 +27,9 @@
 
 #include <optional>
 
+#include "dataflow-scheduler/Dialect/KTDF/Analysis/StageGraph.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/Transforms/SimplifyPipeline.h"
 #include "dataflow-scheduler/Transforms/Passes.h"  // IWYU pragma: keep
 
 #define PASS_NAME "fold-fifo-relay-stages"
@@ -178,40 +179,6 @@ struct Anchor {
   return findAnchors(ends).value_or(llvm::SmallVector<Anchor, 2>{});
 }
 
-/// Returns the stages that await a token @p stage signals, directly or
-/// through other stages.
-[[nodiscard]] auto getDownstreamStages(mlir::ktdf::StageOp stage)
-    -> llvm::SmallPtrSet<mlir::Operation*, 8> {
-  llvm::SmallPtrSet<mlir::Operation*, 8> downstream;
-  llvm::SmallVector<mlir::ktdf::StageOp> worklist{stage};
-  while (!worklist.empty()) {
-    auto current = worklist.pop_back_val();
-    for (auto token : current.getDependsOut()) {
-      for (auto& use : token.getUses()) {
-        auto awaiter = llvm::dyn_cast<mlir::ktdf::StageOp>(use.getOwner());
-        if (awaiter && awaiter.isInDependency(use) &&
-            downstream.insert(awaiter).second) {
-          worklist.push_back(awaiter);
-        }
-      }
-    }
-  }
-  return downstream;
-}
-
-/// Returns the stages other than @p stage that await @p token .
-[[nodiscard]] auto getAwaiters(mlir::Value token, mlir::ktdf::StageOp stage)
-    -> llvm::SetVector<mlir::ktdf::StageOp> {
-  llvm::SetVector<mlir::ktdf::StageOp> awaiters;
-  for (auto& use : token.getUses()) {
-    auto awaiter = llvm::dyn_cast<mlir::ktdf::StageOp>(use.getOwner());
-    if (awaiter && awaiter != stage && awaiter.isInDependency(use)) {
-      awaiters.insert(awaiter);
-    }
-  }
-  return awaiters;
-}
-
 /// Merges the discardable attributes of @p in and @p out , preferring those of
 /// @p in . Returns std::nullopt if a non-mergeable attribute conflicts.
 [[nodiscard]] auto mergeAttrs(mlir::ktdf::DataTransferOp in,
@@ -335,7 +302,7 @@ struct Anchor {
 ///   written, so the write can only move to the producer if the consumer
 ///   awaits it.
 /// - Cycles: the target also awaits what the donor awaits, so no stage that
-///   signals one of those tokens may be downstream of the target.
+///   the donor awaits, other than the target, may depend on the target.
 /// - Anchors: the transfers of the target, and of the donor if any are left,
 ///   must still share an end. An anchor that a stage gains must not be one
 ///   that another stage already has.
@@ -352,40 +319,24 @@ struct Anchor {
     return std::nullopt;
   };
 
+  const mlir::ktdf::StageGraph::Node producer = relay.producer;
+  const mlir::ktdf::StageGraph::Node consumer = relay.consumer;
   if (into_producer) {
-    const auto awaited =
-        llvm::any_of(relay.consumer.getDependsOut(), [&](mlir::Value token) {
-          return !getAwaiters(token, relay.consumer).empty();
-        });
-    const auto awaits_producer =
-        llvm::any_of(relay.consumer.getDependsIn(), [&](mlir::Value token) {
-          return llvm::is_contained(relay.producer.getDependsOut(), token);
-        });
-    if (awaited && !awaits_producer) {
+    if (!consumer.getConsumers().empty() &&
+        !llvm::is_contained(consumer.getProducers(), relay.producer)) {
       return reject("consumer is awaited but does not await the producer");
     }
-  } else {
-    for (auto token : relay.producer.getDependsOut()) {
-      for (auto awaiter : getAwaiters(token, relay.producer)) {
-        if (awaiter != relay.consumer) {
-          return reject("producer token is awaited by another stage");
-        }
-      }
-    }
+  } else if (llvm::any_of(producer.getConsumers(), [&](auto awaiter) {
+               return awaiter != relay.consumer;
+             })) {
+    return reject("producer token is awaited by another stage");
   }
 
-  const auto downstream = getDownstreamStages(target);
-  for (auto token : donor.getDependsIn()) {
-    if (llvm::is_contained(target.getDependsOut(), token)) {
-      continue;
-    }
-    for (auto& use : token.getUses()) {
-      auto signaller = llvm::dyn_cast<mlir::ktdf::StageOp>(use.getOwner());
-      if (signaller && signaller.isOutDependency(use) &&
-          (signaller == target || downstream.contains(signaller))) {
-        return reject("dependencies would form a cycle");
-      }
-    }
+  if (llvm::any_of(mlir::ktdf::StageGraph::Node(donor).getProducers(),
+                   [&](mlir::ktdf::StageGraph::Node awaited) {
+                     return awaited != target && awaited.dependsOn(target);
+                   })) {
+    return reject("dependencies would form a cycle");
   }
 
   // The ends of the transfers of the target and the donor after the fold.
@@ -450,6 +401,7 @@ struct Anchor {
 /// The folded transfer takes the place of the target's half of the relay, and
 /// the target also awaits what the donor awaits. If the donor is left empty, it
 /// is erased, and the stages that awaited it await what it awaited instead.
+/// Repeated and unused tokens are left for normalizeTokens.
 void foldRelay(mlir::RewriterBase& rewriter, Relay relay, bool into_producer,
                const mlir::NamedAttrList& attrs, mlir::ArrayAttr units) {
   auto target = into_producer ? relay.producer : relay.consumer;
@@ -472,15 +424,15 @@ void foldRelay(mlir::RewriterBase& rewriter, Relay relay, bool into_producer,
   rewriter.eraseOp(relay.in);
   rewriter.eraseOp(relay.out);
 
-  llvm::SetVector<mlir::Value> depends_in(target.getDependsIn().begin(),
-                                          target.getDependsIn().end());
+  // The target must not await its own tokens.
+  auto depends_in = llvm::to_vector(target.getDependsIn());
   for (auto token : donor.getDependsIn()) {
     if (!llvm::is_contained(target.getDependsOut(), token)) {
-      depends_in.insert(token);
+      depends_in.push_back(token);
     }
   }
   rewriter.modifyOpInPlace(target, [&]() {
-    target.setDependsIn(depends_in.getArrayRef());
+    target.setDependsIn(depends_in);
     if (units) {
       target.setApplicableUnitsAttr(units);
     } else {
@@ -491,32 +443,15 @@ void foldRelay(mlir::RewriterBase& rewriter, Relay relay, bool into_producer,
   if (!donor.getBody()->empty()) {
     return;
   }
-  for (auto token : llvm::to_vector(donor.getDependsOut())) {
-    for (auto awaiter : getAwaiters(token, donor)) {
-      llvm::SetVector<mlir::Value> awaited;
-      for (auto other : awaiter.getDependsIn()) {
-        if (other != token) {
-          awaited.insert(other);
-        }
+  for (auto awaiter :
+       llvm::to_vector(mlir::ktdf::StageGraph::Node(donor).getConsumers())) {
+    rewriter.modifyOpInPlace(awaiter, [&]() {
+      for (auto token : donor.getDependsIn()) {
+        awaiter.addInDependency(
+            llvm::cast<mlir::TypedValue<mlir::ktdf::TokenType>>(token));
       }
-      awaited.insert(donor.getDependsIn().begin(), donor.getDependsIn().end());
-      rewriter.modifyOpInPlace(
-          awaiter, [&]() { awaiter.setDependsIn(awaited.getArrayRef()); });
-    }
+    });
   }
-  // Once the donor is gone, the target signals what only the donor awaited
-  // for no one.
-  llvm::SmallVector<mlir::Value> depends_out;
-  for (auto token : target.getDependsOut()) {
-    if (!llvm::is_contained(donor.getDependsIn(), token) ||
-        llvm::any_of(
-            getAwaiters(token, target),
-            [&](mlir::ktdf::StageOp awaiter) { return awaiter != donor; })) {
-      depends_out.push_back(token);
-    }
-  }
-  rewriter.modifyOpInPlace(target,
-                           [&]() { target.setDependsOut(depends_out); });
   rewriter.eraseOp(donor);
 }
 
@@ -555,42 +490,6 @@ auto foldFirstRelay(mlir::RewriterBase& rewriter,
     }
   }
   return false;
-}
-
-/// Reorders the stages of @p pipeline so that each comes after the stages it
-/// awaits. A fold into a producer can make it await a stage that comes later.
-///
-/// Repeatedly places the first remaining stage, in the current order, whose
-/// awaited stages are all placed, so stages that are already in order stay.
-void sortStages(mlir::RewriterBase& rewriter, mlir::ktdf::PipelineOp pipeline) {
-  auto remaining = llvm::to_vector(pipeline.getStages());
-  llvm::SmallPtrSet<mlir::Operation*, 8> placed;
-  const auto isReady = [&](mlir::ktdf::StageOp stage) {
-    return llvm::all_of(stage.getDependsIn(), [&](mlir::Value token) {
-      return llvm::all_of(token.getUses(), [&](mlir::OpOperand& use) {
-        auto signaller = llvm::dyn_cast<mlir::ktdf::StageOp>(use.getOwner());
-        return !signaller || signaller == stage ||
-               !signaller.isOutDependency(use) || placed.contains(signaller) ||
-               !llvm::is_contained(remaining, signaller);
-      });
-    });
-  };
-
-  mlir::Operation* last = nullptr;
-  while (!remaining.empty()) {
-    auto* ready = llvm::find_if(remaining, isReady);
-    if (ready == remaining.end()) {
-      // A cycle in the input. Leave the rest as it is.
-      return;
-    }
-    auto stage = *ready;
-    remaining.erase(ready);
-    if (last && stage->isBeforeInBlock(last)) {
-      rewriter.moveOpAfter(stage, last);
-    }
-    placed.insert(stage);
-    last = stage;
-  }
 }
 
 /// Drops the slots without uses from @p alloc , unless it has no slots in use
@@ -650,9 +549,10 @@ struct FoldFifoRelayStagesPass
         return;
       }
 
-      sortStages(rewriter, pipeline);
-
-      // Drop the private slots and tokens left without users.
+      // A fold into a producer can make it await a stage that comes later.
+      mlir::ktdf::orderStages(rewriter, pipeline);
+      // Drop the repeated tokens, and the slots and tokens left without users.
+      mlir::ktdf::normalizeTokens(rewriter, pipeline);
       mlir::ktdf::PrivateBuilder::canonicalize(rewriter, pipeline);
       if (auto private_op = pipeline.getPrivateOp(); private_op) {
         for (auto alloc : llvm::to_vector(
