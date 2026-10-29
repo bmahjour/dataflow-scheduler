@@ -49,13 +49,10 @@ using namespace scheduler;
 
 namespace scheduler {
 
-namespace {
+using arch_view::RoutingGraph;
+using ResourceKind = RoutingGraph::ResourceNode::ResourceKind;
 
-/// Helper to create an identity affine map for intermediate buffer accesses
-static mlir::AffineMap createAffineMapForIntermediateBuffer(
-    const PrivateResourceSpec* buffer, mlir::MLIRContext* context) {
-  return mlir::AffineMap::getMultiDimIdentityMap(buffer->shape.size(), context);
-}
+namespace {
 
 /// Helper to validate FIFO slot index assignment
 /// Checks that the assigned slot index matches the original result index
@@ -302,11 +299,8 @@ struct TransferEnds {
 /// transfer that fills the IAB next to them would otherwise add its "IAB"
 /// destination. For an indirect transfer only the data operands count, not
 /// the address operands.
-static TransferEnds collectTransferEnds(
-    mlir::ktdf::StageOp stage_op,
-    const scheduler::arch_view::RoutingGraph& arch_graph) {
-  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
-
+static TransferEnds collectTransferEnds(mlir::ktdf::StageOp stage_op,
+                                        const RoutingGraph& arch_graph) {
   // The source and destination operands of every transfer.
   llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> operands;
   stage_op.walk([&](mlir::ktdf::IndDataTransferOp op) {
@@ -330,10 +324,10 @@ static TransferEnds collectTransferEnds(
     // A device may have several copies of a unit, for example one per
     // sub-core. They share a name, so every node with that name must be a
     // load/store unit.
-    llvm::ArrayRef<scheduler::arch_view::RoutingGraph::NodeId> ids =
+    llvm::ArrayRef<RoutingGraph::NodeId> ids =
         arch_graph.getNodeIdsForResource(end);
     if (ids.empty() || llvm::any_of(ids, [&](auto id) {
-          return arch_graph.getNode(id)->kind != RK::LoadStoreUnit;
+          return arch_graph.getNode(id)->kind != ResourceKind::LoadStoreUnit;
         }))
       return nullptr;
     return end;
@@ -386,8 +380,7 @@ using StageSideMap = llvm::DenseMap<StageNode*, StageSide>;
 /// Only stages whose applicable unit is a Compute node in the routing graph
 /// count. A stage pinned to a load/store unit is still an ordinary load-side
 /// or store-side stage.
-static bool isComputeAnchor(
-    StageNode* stage, const scheduler::arch_view::RoutingGraph& arch_graph) {
+static bool isComputeAnchor(StageNode* stage, const RoutingGraph& arch_graph) {
   auto stage_op =
       mlir::dyn_cast_or_null<mlir::ktdf::StageOp>(stage->getOperation());
   if (!stage_op) return false;
@@ -396,8 +389,7 @@ static bool isComputeAnchor(
   auto unit = llvm::dyn_cast<ResourceType>(units->getValue()[0]);
   if (!unit) return false;
   auto node = arch_graph.getNode(unit);
-  return node && node->kind == scheduler::arch_view::RoutingGraph::
-                                   ResourceNode::ResourceKind::Compute;
+  return node && node->kind == ResourceKind::Compute;
 }
 
 /// Decide, for every original stage, whether it is on the load side, is a
@@ -421,8 +413,7 @@ static bool isComputeAnchor(
 /// downstream. Then walk in reverse order to mark the upstream stages the
 /// same way. Every non-compute stage must end up with exactly one mark.
 static llvm::FailureOr<StageSideMap> classifyStageSides(
-    llvm::ArrayRef<StageNode*> sorted_stages,
-    const scheduler::arch_view::RoutingGraph& arch_graph) {
+    llvm::ArrayRef<StageNode*> sorted_stages, const RoutingGraph& arch_graph) {
   llvm::SmallPtrSet<StageNode*, 4> anchors;
   for (StageNode* stage : sorted_stages)
     if (isComputeAnchor(stage, arch_graph)) anchors.insert(stage);
@@ -480,8 +471,8 @@ static llvm::FailureOr<StageSideMap> classifyStageSides(
 /// shape path expansion can handle, and work out which side of the compute
 /// stages each stage is on. See classifyStageSides() for the rules.
 static llvm::FailureOr<llvm::SmallVector<StageNode*>> sortAndValidateStages(
-    PipelineTree& tree, PipelineNode* pipeline,
-    const scheduler::arch_view::RoutingGraph& arch_graph, StageSideMap& sides) {
+    PipelineTree& tree, PipelineNode* pipeline, const RoutingGraph& arch_graph,
+    StageSideMap& sides) {
   llvm::FailureOr<llvm::SmallVector<StageNode*>> sorted_stages_or =
       tree.topologicalSortStages(pipeline);
   if (mlir::failed(sorted_stages_or)) {
@@ -508,26 +499,24 @@ static llvm::FailureOr<llvm::SmallVector<StageNode*>> sortAndValidateStages(
 ///
 /// A device may have several copies of the unit, for example one per
 /// sub-core. All copies must work on the same memory.
-static ResourceType memoryOfUnit(
-    ResourceType unit, StageSide side,
-    const scheduler::arch_view::RoutingGraph& arch_graph) {
-  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
-  using NodeId = scheduler::arch_view::RoutingGraph::NodeId;
-
+static ResourceType memoryOfUnit(ResourceType unit, StageSide side,
+                                 const RoutingGraph& arch_graph) {
   llvm::SmallSetVector<ResourceType, 2> memories;
-  auto consider = [&](NodeId node_id) {
+  auto consider = [&](RoutingGraph::NodeId node_id) {
     auto node = arch_graph.getNode(node_id);
-    if (node && node->kind == RK::Memory) memories.insert(node->resource);
+    if (node && node->kind == ResourceKind::Memory)
+      memories.insert(node->resource);
   };
-  for (NodeId unit_id : arch_graph.getNodeIdsForResource(unit)) {
+  for (RoutingGraph::NodeId unit_id : arch_graph.getNodeIdsForResource(unit)) {
     if (side == StageSide::kLoad) {
       // Memories with a datapath into the unit.
-      for (NodeId node_id : arch_graph.getAllNodeIds())
+      for (RoutingGraph::NodeId node_id : arch_graph.getAllNodeIds())
         if (llvm::is_contained(arch_graph.getNeighbors(node_id), unit_id))
           consider(node_id);
     } else {
       // Memories the unit has a datapath into.
-      for (NodeId node_id : arch_graph.getNeighbors(unit_id)) consider(node_id);
+      for (RoutingGraph::NodeId node_id : arch_graph.getNeighbors(unit_id))
+        consider(node_id);
     }
   }
   return memories.size() == 1 ? memories.front() : nullptr;
@@ -578,8 +567,7 @@ static ResourceType memoryOfUnit(
 /// successors must write to memory. Both are asserted.
 static mlir::LogicalResult assignOriginalStageResources(
     llvm::ArrayRef<StageNode*> sorted_stages, const StageSideMap& sides,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
-    PathExpansionPlan* plan) {
+    const RoutingGraph& arch_graph, PathExpansionPlan* plan) {
   // Stages that some other stage feeds into.
   llvm::SmallPtrSet<StageNode*, 8> has_predecessor;
   for (StageNode* stage : sorted_stages)
@@ -800,7 +788,7 @@ struct DataFlow {
   StageNode* producer = nullptr;
   StageNode* consumer = nullptr;
 
-  scheduler::arch_view::RoutingGraph::Path path;
+  RoutingGraph::Path path;
   // Last path index that is part of the producer.
   size_t producer_end = 0;
   // First path index that is part of the consumer.
@@ -830,6 +818,15 @@ struct DataFlow {
   size_t middleEnd() const { return consumer_begin; }
 };
 }  // namespace
+
+/// Return the routing-graph node at index \p idx of \p flow's path.
+static RoutingGraph::ResourceNode pathNode(const RoutingGraph& arch_graph,
+                                           const DataFlow& flow, size_t idx) {
+  std::optional<RoutingGraph::ResourceNode> node =
+      arch_graph.getNode(flow.path[idx]);
+  assert(node && "node in path must exist in graph");
+  return *node;
+}
 
 /// Find the data each original stage passes to the stages it has a
 /// dependency on. See DataFlow.
@@ -946,25 +943,20 @@ static std::vector<DataFlow> collectDataFlows(
 /// The path depends only on the resources of the two stages, so all flows
 /// between the same two stages get the same path. Fails if some flow has no
 /// path in the routing graph.
-static mlir::LogicalResult routeDataFlows(
-    llvm::MutableArrayRef<DataFlow> flows, const StageSideMap& sides,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
-    const PathExpansionPlan* plan) {
-  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
-
+static mlir::LogicalResult routeDataFlows(llvm::MutableArrayRef<DataFlow> flows,
+                                          const StageSideMap& sides,
+                                          const RoutingGraph& arch_graph,
+                                          const PathExpansionPlan* plan) {
   auto nodeAt = [&](const DataFlow& flow, size_t idx) {
-    auto node = arch_graph.getNode(flow.path[idx]);
-    assert(node && "node in path must exist in graph");
-    return *node;
+    return pathNode(arch_graph, flow, idx);
   };
 
   for (DataFlow& flow : flows) {
-    std::optional<scheduler::arch_view::RoutingGraph::Path> path =
-        arch_graph.findShortestPath(
-            arch_graph.getNodeIdForResource(
-                plan->stage_info.at(flow.producer).stage_resource),
-            arch_graph.getNodeIdForResource(
-                plan->stage_info.at(flow.consumer).stage_resource));
+    std::optional<RoutingGraph::Path> path = arch_graph.findShortestPath(
+        arch_graph.getNodeIdForResource(
+            plan->stage_info.at(flow.producer).stage_resource),
+        arch_graph.getNodeIdForResource(
+            plan->stage_info.at(flow.consumer).stage_resource));
     if (!path || path->empty()) {
       LDBG(1) << "No routing path from stage " << flow.producer->getStageId()
               << " to stage " << flow.consumer->getStageId();
@@ -978,8 +970,8 @@ static mlir::LogicalResult routeDataFlows(
     // The load unit right after a load-side producer's memory is part of the
     // producer, unless that unit is the consumer's own resource.
     if (sides.at(flow.producer) == StageSide::kLoad && last > 1 &&
-        nodeAt(flow, 0).kind == RK::Memory &&
-        nodeAt(flow, 1).kind == RK::LoadStoreUnit) {
+        nodeAt(flow, 0).kind == ResourceKind::Memory &&
+        nodeAt(flow, 1).kind == ResourceKind::LoadStoreUnit) {
       flow.producer_end = 1;
       flow.producer_unit = nodeAt(flow, 1).resource;
     }
@@ -987,8 +979,9 @@ static mlir::LogicalResult routeDataFlows(
     // The store unit right before a store-side consumer's memory is part of
     // the consumer, unless it is already part of the producer.
     if (sides.at(flow.consumer) == StageSide::kStore &&
-        last > flow.producer_end + 1 && nodeAt(flow, last).kind == RK::Memory &&
-        nodeAt(flow, last - 1).kind == RK::LoadStoreUnit) {
+        last > flow.producer_end + 1 &&
+        nodeAt(flow, last).kind == ResourceKind::Memory &&
+        nodeAt(flow, last - 1).kind == ResourceKind::LoadStoreUnit) {
       flow.consumer_begin = last - 1;
       flow.consumer_unit = nodeAt(flow, last - 1).resource;
     }
@@ -999,17 +992,12 @@ static mlir::LogicalResult routeDataFlows(
 /// Return true if path expansion has to add stages: some path passes through
 /// a memory or compute unit that is part of neither the producer nor the
 /// consumer. A load/store unit with no stage does not count on its own.
-static bool needsExpansion(
-    llvm::ArrayRef<DataFlow> flows,
-    const scheduler::arch_view::RoutingGraph& arch_graph) {
+static bool needsExpansion(llvm::ArrayRef<DataFlow> flows,
+                           const RoutingGraph& arch_graph) {
   for (const DataFlow& flow : flows) {
-    for (size_t i = flow.middleBegin(); i < flow.middleEnd(); ++i) {
-      auto node = arch_graph.getNode(flow.path[i]);
-      assert(node && "node in path must exist in graph");
-      if (node->kind != scheduler::arch_view::RoutingGraph::ResourceNode::
-                            ResourceKind::LoadStoreUnit)
+    for (size_t i = flow.middleBegin(); i < flow.middleEnd(); ++i)
+      if (pathNode(arch_graph, flow, i).kind != ResourceKind::LoadStoreUnit)
         return true;
-    }
   }
   return false;
 }
@@ -1028,15 +1016,12 @@ static bool needsExpansion(
 /// of them.
 static mlir::LogicalResult assignOriginalStageUnits(
     llvm::ArrayRef<DataFlow> flows, llvm::ArrayRef<StageNode*> sorted_stages,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
-    PathExpansionPlan* plan) {
-  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
-
+    const RoutingGraph& arch_graph, PathExpansionPlan* plan) {
   // A stage whose resource is a compute or load/store unit runs on it.
   for (StageNode* stage : sorted_stages) {
     StageMaterializationInfo& info = plan->getStageInfo(stage);
     auto node = arch_graph.getNode(info.stage_resource);
-    if (node && node->kind != RK::Memory)
+    if (node && node->kind != ResourceKind::Memory)
       info.applicable_unit = info.stage_resource;
   }
 
@@ -1076,6 +1061,39 @@ static mlir::LogicalResult assignOriginalStageUnits(
   return mlir::success();
 }
 
+/// Make each flow that got hop stages pass through them: the dependency
+/// producer -> consumer becomes producer -> hop stages -> consumer. The
+/// direct dependency is kept only if some other flow between the same two
+/// stages needs no hops.
+static void rewireDependencies(llvm::ArrayRef<DataFlow> flows) {
+  llvm::MapVector<std::pair<StageNode*, StageNode*>,
+                  llvm::SmallVector<const DataFlow*, 2>>
+      flows_by_pair;
+  for (const DataFlow& flow : flows)
+    flows_by_pair[{flow.producer, flow.consumer}].push_back(&flow);
+
+  auto addDependency = [](StageNode* from, StageNode* to) {
+    if (!llvm::is_contained(from->getDependencies(), to))
+      from->addDependency(to);
+  };
+  for (const auto& [pair, pair_flows] : flows_by_pair) {
+    auto [producer, consumer] = pair;
+    auto hasChain = [](const DataFlow* flow) { return !flow->chain.empty(); };
+    if (llvm::none_of(pair_flows, hasChain)) continue;
+    if (llvm::all_of(pair_flows, hasChain)) {
+      producer->nullifyDependency(consumer);
+      producer->removeNullifiedDependencies();
+    }
+    for (const DataFlow* flow : pair_flows) {
+      if (!hasChain(flow)) continue;
+      addDependency(producer, flow->chain.front());
+      for (size_t k = 0; k + 1 < flow->chain.size(); ++k)
+        addDependency(flow->chain[k], flow->chain[k + 1]);
+      addDependency(flow->chain.back(), consumer);
+    }
+  }
+}
+
 /// Step 1: Add the stages that move data through memories and units that have
 /// no stage of their own on a path.
 ///
@@ -1091,10 +1109,8 @@ static mlir::LogicalResult assignOriginalStageUnits(
 ///     stage or a new stage made for another flow, and it must use the same
 ///     memory as the hop.
 ///
-/// Then, for each pair of stages with a flow that got hops, the dependency
-/// producer -> consumer becomes producer -> hop stages -> consumer for each
-/// such flow. The direct dependency is kept only if some flow between the two
-/// stages needs no hops.
+/// Then the dependencies are rewired through the hop stages (see
+/// rewireDependencies).
 ///
 /// Giving a hop to an existing stage makes that stage depend on the producer.
 /// If the existing stage is upstream of the producer, that creates a cycle;
@@ -1106,11 +1122,8 @@ static mlir::LogicalResult assignOriginalStageUnits(
 static mlir::LogicalResult expandDataFlows(
     PipelineTree& tree, PipelineNode* pipeline,
     llvm::MutableArrayRef<DataFlow> flows,
-    llvm::ArrayRef<StageNode*> sorted_stages,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
+    llvm::ArrayRef<StageNode*> sorted_stages, const RoutingGraph& arch_graph,
     PathExpansionPlan* plan, int& next_stage_id) {
-  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
-
   // The stage running on each unit. assignOriginalStageUnits() made sure the
   // original stages all run on different units.
   llvm::DenseMap<ResourceType, StageNode*> unit_owner;
@@ -1170,81 +1183,54 @@ static mlir::LogicalResult expandDataFlows(
     size_t end = flow.middleEnd();
     flow.boundaries.push_back(flow.middleBegin());
     for (size_t i = flow.middleBegin(); i < end;) {
-      auto node = arch_graph.getNode(flow.path[i]);
-      assert(node && "node in path must exist in graph");
-      decltype(node) next;
-      if (i + 1 < end) next = arch_graph.getNode(flow.path[i + 1]);
+      RoutingGraph::ResourceNode node = pathNode(arch_graph, flow, i);
+      std::optional<RoutingGraph::ResourceNode> next;
+      if (i + 1 < end) next = pathNode(arch_graph, flow, i + 1);
 
-      switch (node->kind) {
-        case RK::Memory:
+      // The hop starting at path index i: its memory (may be null), its unit,
+      // and the number of path nodes it covers.
+      ResourceType memory, unit;
+      size_t width = 1;
+      switch (node.kind) {
+        case ResourceKind::Memory:
           // A memory with no stage must be followed by the unit that reads
           // it.
-          if (!next || next->kind != RK::LoadStoreUnit) {
-            LDBG(1) << "Memory " << node->resource << " between stage "
+          if (!next || next->kind != ResourceKind::LoadStoreUnit) {
+            LDBG(1) << "Memory " << node.resource << " between stage "
                     << flow.producer->getStageId() << " and stage "
                     << flow.consumer->getStageId()
                     << " has no load unit after it";
             return mlir::failure();
           }
-          if (mlir::failed(addHop(node->resource, next->resource)))
-            return mlir::failure();
-          i += 2;
+          memory = node.resource;
+          unit = next->resource;
+          width = 2;
           break;
-        case RK::LoadStoreUnit:
-          if (next && next->kind == RK::Memory) {
-            if (mlir::failed(addHop(next->resource, node->resource)))
-              return mlir::failure();
-            i += 2;
-          } else {
-            if (mlir::failed(addHop(ResourceType(), node->resource)))
-              return mlir::failure();
-            i += 1;
+        case ResourceKind::LoadStoreUnit:
+          unit = node.resource;
+          if (next && next->kind == ResourceKind::Memory) {
+            memory = next->resource;
+            width = 2;
           }
           break;
-        case RK::Compute:
+        case ResourceKind::Compute:
           // Hop stages only move data between memories through load/store
           // units. Passing data through a compute unit would need a compute
           // stage that relays it, which path expansion does not create.
           LDBG(1) << "Path from stage " << flow.producer->getStageId()
                   << " to stage " << flow.consumer->getStageId()
-                  << " passes through compute unit " << node->resource
+                  << " passes through compute unit " << node.resource
                   << ", which has no stage";
           return mlir::failure();
       }
+      if (mlir::failed(addHop(memory, unit))) return mlir::failure();
+      i += width;
       flow.boundaries.push_back(i);
     }
     if (chain.empty()) flow.boundaries.clear();
   }
 
-  // Rewire the dependencies of every pair of stages with a flow that got
-  // hops.
-  llvm::MapVector<std::pair<StageNode*, StageNode*>,
-                  llvm::SmallVector<const DataFlow*, 2>>
-      flows_by_pair;
-  for (const DataFlow& flow : flows)
-    flows_by_pair[{flow.producer, flow.consumer}].push_back(&flow);
-
-  auto addDependency = [](StageNode* from, StageNode* to) {
-    if (!llvm::is_contained(from->getDependencies(), to))
-      from->addDependency(to);
-  };
-  for (const auto& [pair, pair_flows] : flows_by_pair) {
-    auto [producer, consumer] = pair;
-    auto hasChain = [](const DataFlow* flow) { return !flow->chain.empty(); };
-    if (llvm::none_of(pair_flows, hasChain)) continue;
-    if (llvm::all_of(pair_flows, hasChain)) {
-      producer->nullifyDependency(consumer);
-      producer->removeNullifiedDependencies();
-    }
-    for (const DataFlow* flow : pair_flows) {
-      if (!hasChain(flow)) continue;
-      addDependency(producer, flow->chain.front());
-      for (size_t k = 0; k + 1 < flow->chain.size(); ++k)
-        addDependency(flow->chain[k], flow->chain[k + 1]);
-      addDependency(flow->chain.back(), consumer);
-    }
-  }
-
+  rewireDependencies(flows);
   return mlir::success();
 }
 
@@ -1326,17 +1312,16 @@ struct Tile {
 /// into that memory, and the data is held in a buffer there. Otherwise the
 /// sending stage ends with its unit and the receiving stage starts with its
 /// unit, and the data is held in a FIFO between the two.
-static BoundaryPlace boundaryPlace(
-    const DataFlow& flow, size_t k,
-    const scheduler::arch_view::RoutingGraph& arch_graph) {
-  using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
+static BoundaryPlace boundaryPlace(const DataFlow& flow, size_t k,
+                                   const RoutingGraph& arch_graph) {
   size_t idx = flow.boundaries[k];
-  auto sender_last = arch_graph.getNode(flow.path[idx - 1]);
-  auto receiver_first = arch_graph.getNode(flow.path[idx]);
-  assert(sender_last && receiver_first && "node in path must exist in graph");
-  if (receiver_first->kind == RK::Memory) return {receiver_first->resource, {}, {}};
-  if (sender_last->kind == RK::Memory) return {sender_last->resource, {}, {}};
-  return {{}, sender_last->resource, receiver_first->resource};
+  RoutingGraph::ResourceNode sender_last = pathNode(arch_graph, flow, idx - 1);
+  RoutingGraph::ResourceNode receiver_first = pathNode(arch_graph, flow, idx);
+  if (receiver_first.kind == ResourceKind::Memory)
+    return {receiver_first.resource, {}, {}};
+  if (sender_last.kind == ResourceKind::Memory)
+    return {sender_last.resource, {}, {}};
+  return {{}, sender_last.resource, receiver_first.resource};
 }
 
 /// Return the shape of the data that \p op moves on one side, the side that
@@ -1496,8 +1481,7 @@ static void recordCarrier(const TransferMaterializationInfo* transfer,
 /// this order keeps the new buffers and FIFOs in a stable order.
 static mlir::LogicalResult adaptFlowEnds(
     llvm::ArrayRef<StageNode*> expanded_stages,
-    llvm::MutableArrayRef<DataFlow> flows,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
+    llvm::MutableArrayRef<DataFlow> flows, const RoutingGraph& arch_graph,
     PathExpansionPlan* plan, BoundaryFifos& fifos) {
   // The flow ends of every op: the flow, and whether the op is its producer.
   llvm::DenseMap<mlir::Operation*,
@@ -1555,8 +1539,8 @@ static mlir::LogicalResult adaptFlowEnds(
                                        : place.fifo_src;
     ResourceType source_resource = is_producer ? here : there;
     ResourceType dest_resource = is_producer ? there : here;
-    scheduler::arch_view::RoutingGraph::EdgeInfo edge{
-        flow.path[flow.boundaries[k] - 1], flow.path[flow.boundaries[k]], 1};
+    RoutingGraph::EdgeInfo edge{flow.path[flow.boundaries[k] - 1],
+                                flow.path[flow.boundaries[k]], 1};
 
     if (is_fifo_op) {
       auto [spec, slot] = fifos.get(flow, place.fifo_src, place.fifo_dest,
@@ -1653,8 +1637,7 @@ static bool transferRewritesFifo(const TransferMaterializationInfo* transfer,
 /// The new allocation mirrors the original fifo.allocate slot for slot, since
 /// slot order is significant for FIFO semantics.
 static mlir::LogicalResult retypeFifosBetweenOriginalStages(
-    const FifoEndpoints& endpoints,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
+    const FifoEndpoints& endpoints, const RoutingGraph& arch_graph,
     PathExpansionPlan* plan) {
   const llvm::MapVector<mlir::Value, FifoEndpoint>& producers =
       endpoints.producers;
@@ -1768,12 +1751,11 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
 
       // Use a dummy edge when no direct edge exists between the stage
       // resources (they usually go through LS-unit nodes).
-      scheduler::arch_view::RoutingGraph::NodeId src_node_id =
+      RoutingGraph::NodeId src_node_id =
           arch_graph.getNodeIdForResource(producer_info.stage_resource);
-      scheduler::arch_view::RoutingGraph::NodeId dst_node_id =
+      RoutingGraph::NodeId dst_node_id =
           arch_graph.getNodeIdForResource(consumer_info.stage_resource);
-      scheduler::arch_view::RoutingGraph::EdgeInfo edge{src_node_id,
-                                                        dst_node_id, 1};
+      RoutingGraph::EdgeInfo edge{src_node_id, dst_node_id, 1};
       if (auto edge_opt = arch_graph.getEdgeInfo(src_node_id, dst_node_id))
         edge = *edge_opt;
 
@@ -1851,23 +1833,22 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
 /// How it works: walk the flows in order. For each flow with hops, create the
 /// carriers of its inner boundaries, then one transfer for each hop stage.
 static mlir::LogicalResult populateHopStageTransfers(
-    llvm::MutableArrayRef<DataFlow> flows,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
+    llvm::MutableArrayRef<DataFlow> flows, const RoutingGraph& arch_graph,
     PathExpansionPlan* plan, BoundaryFifos& fifos) {
   for (DataFlow& flow : flows) {
     if (flow.chain.empty()) continue;
     mlir::Operation* context_op = flow.producer->getOperation();
     mlir::OpBuilder builder(context_op->getContext());
+    llvm::FailureOr<Tile> tile = flowTile(flow);
 
     // Carriers between two hop stages.
+    if (flow.chain.size() > 1 && mlir::failed(tile)) {
+      LDBG(1) << "Flow from stage " << flow.producer->getStageId()
+              << " to stage " << flow.consumer->getStageId()
+              << " moves data of a dynamic size";
+      return mlir::failure();
+    }
     for (size_t k = 1; k < flow.chain.size(); ++k) {
-      llvm::FailureOr<Tile> tile = flowTile(flow);
-      if (mlir::failed(tile)) {
-        LDBG(1) << "Flow from stage " << flow.producer->getStageId()
-                << " to stage " << flow.consumer->getStageId()
-                << " moves data of a dynamic size";
-        return mlir::failure();
-      }
       BoundaryPlace place = boundaryPlace(flow, k, arch_graph);
       Carrier& carrier = flow.carriers[k];
       if (place.memory) {
@@ -1891,33 +1872,37 @@ static mlir::LogicalResult populateHopStageTransfers(
              "Every boundary of a flow with hops should have a carrier");
 
       // The stage ends this transfer connects; only for debug output.
-      auto source_node = arch_graph.getNode(flow.path[flow.boundaries[k] - 1]);
-      auto dest_node = arch_graph.getNode(flow.path[flow.boundaries[k + 1]]);
-      assert(source_node && dest_node && "node in path must exist in graph");
-      scheduler::arch_view::RoutingGraph::EdgeInfo edge{
-          flow.path[flow.boundaries[k] - 1], flow.path[flow.boundaries[k + 1]],
-          1};
+      size_t source_idx = flow.boundaries[k] - 1;
+      size_t dest_idx = flow.boundaries[k + 1];
+      RoutingGraph::ResourceNode source_node =
+          pathNode(arch_graph, flow, source_idx);
+      RoutingGraph::ResourceNode dest_node =
+          pathNode(arch_graph, flow, dest_idx);
+      RoutingGraph::EdgeInfo edge{flow.path[source_idx], flow.path[dest_idx],
+                                  1};
 
-      mlir::AffineMap source_map = source.map;
-      if (!source_map && source.spec->kind != PrivateResourceSpec::Kind::kFifo)
-        source_map = createAffineMapForIntermediateBuffer(source.spec,
-                                                          builder.getContext());
-      mlir::AffineMap dest_map = dest.map;
-      if (!dest_map && dest.spec->kind != PrivateResourceSpec::Kind::kFifo)
-        dest_map = createAffineMapForIntermediateBuffer(dest.spec,
-                                                        builder.getContext());
+      // A buffer without a map is accessed with the identity map.
+      auto mapFor = [&](const Carrier& carrier) {
+        if (carrier.map ||
+            carrier.spec->kind == PrivateResourceSpec::Kind::kFifo)
+          return carrier.map;
+        return mlir::AffineMap::getMultiDimIdentityMap(
+            carrier.spec->shape.size(), builder.getContext());
+      };
+      mlir::AffineMap source_map = mapFor(source);
+      mlir::AffineMap dest_map = mapFor(dest);
 
       TransferMaterializationInfo* transfer =
           plan->transfer_factory.createSynthetic(
-              edge, source_node->resource, dest_node->resource, source.spec,
+              edge, source_node.resource, dest_node.resource, source.spec,
               source.slot_index, source.indices, source.sizes, source_map,
               dest.spec, dest.slot_index, dest.indices, dest.sizes, dest_map,
               builder.getContext());
       plan->getStageInfo(flow.chain[k]).transfers.push_back(transfer);
 
       LDBG(1) << "  Stage " << flow.chain[k]->getStageId()
-              << ": created transfer " << source_node->resource << " -> "
-              << dest_node->resource << " for the flow from stage "
+              << ": created transfer " << source_node.resource << " -> "
+              << dest_node.resource << " for the flow from stage "
               << flow.producer->getStageId() << " to stage "
               << flow.consumer->getStageId() << "\n";
     }
@@ -1967,8 +1952,7 @@ static void debugPrintPlanningSummary(
 static mlir::LogicalResult buildExpansionPlan(
     PipelineTree& tree, PipelineNode* pipeline,
     llvm::MutableArrayRef<DataFlow> flows, const FifoEndpoints& fifo_endpoints,
-    llvm::ArrayRef<StageNode*> sorted_stages,
-    const scheduler::arch_view::RoutingGraph& arch_graph,
+    llvm::ArrayRef<StageNode*> sorted_stages, const RoutingGraph& arch_graph,
     PathExpansionPlan* plan, int& next_stage_id) {
   if (fifo_endpoints.duplicate) {
     auto [op, is_producer] = *fifo_endpoints.duplicate;
@@ -2044,7 +2028,7 @@ static mlir::LogicalResult buildExpansionPlan(
 
 std::unique_ptr<PathExpansionPlan> planPathExpansion(
     PipelineTree& tree, PipelineNode* pipeline,
-    const scheduler::arch_view::RoutingGraph& arch_graph) {
+    const RoutingGraph& arch_graph) {
   auto plan = std::make_unique<PathExpansionPlan>();
   plan->changed = false;
 
