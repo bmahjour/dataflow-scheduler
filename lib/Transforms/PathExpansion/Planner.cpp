@@ -750,8 +750,8 @@ static mlir::OpResult getFifoAllocateResult(mlir::Value fifo_slot) {
 }
 
 namespace {
-/// What carries a flow's data across one boundary between two stages: a
-/// buffer, FIFO slot or original memref, and how a transfer addresses it.
+/// What holds a flow's data at one boundary (see DataFlow): a buffer, FIFO
+/// slot or original memref, and how a transfer addresses it.
 struct Carrier {
   const PrivateResourceSpec* spec = nullptr;
   size_t slot_index = 0;
@@ -767,11 +767,32 @@ struct Carrier {
 /// and the producer stage has a dependency on the consumer stage.
 ///
 /// The route is a routing-graph path from the producer's resource to the
-/// consumer's resource. Its first nodes belong to the producer and its last
-/// nodes to the consumer. Any nodes left in the middle are hops the data
-/// passes through. Step 1 gives each hop to the stage that runs on its unit,
-/// or creates a new (synthetic) stage for it. Those hop stages form the
-/// flow's chain.
+/// consumer's resource. Step 1 splits the middle of the path into hops and
+/// gives each hop to the stage that runs on its unit, or creates a new
+/// (synthetic) stage for it. Those hop stages form the flow's chain.
+///
+/// Each stage on the route, producer -> chain -> consumer, works on one
+/// memory through one unit: its stage_resource and its applicable unit. On
+/// the path the two are next to each other. A load unit reads its memory, so
+/// the memory comes first, as in L1 -> L1LU. A store unit writes its memory,
+/// so the unit comes first, as in L1SU -> L1. A compute stage, or a hop on a
+/// unit with no memory, is just its unit. At the two ends of the path a stage
+/// may appear only in part, since the path starts at the producer's resource
+/// and ends at the consumer's resource.
+///
+/// A boundary is where the data leaves one stage on the route and enters the
+/// next. Something must hold the data there:
+///  - a buffer in the receiving stage's memory, if that stage loads from it;
+///  - a buffer in the sending stage's memory, if that stage stores into it;
+///  - otherwise the two units are next to each other, and a FIFO from the
+///    sending unit to the receiving unit.
+/// With n hop stages there are n + 1 boundaries.
+///
+/// For example, take DDR -> MNILU -> L1 -> L1LU -> SFU from a load stage to a
+/// compute stage. The load stage is DDR read by MNILU, the hop stage is L1
+/// read by L1LU, and the compute stage is SFU. Boundary 0, from the load
+/// stage to the hop, is held in an L1 buffer, because the hop loads from L1.
+/// Boundary 1, from the hop to SFU, is held in an "L1LU" -> "SFU" FIFO.
 struct DataFlow {
   mlir::Value carrier;
   mlir::Operation* producer_op = nullptr;
@@ -780,9 +801,9 @@ struct DataFlow {
   StageNode* consumer = nullptr;
 
   scheduler::arch_view::RoutingGraph::Path path;
-  // Last path index owned by the producer.
+  // Last path index that is part of the producer.
   size_t producer_end = 0;
-  // First path index owned by the consumer.
+  // First path index that is part of the consumer.
   size_t consumer_begin = 0;
   // Load/store units the path gives the producer and the consumer, if any.
   ResourceType producer_unit;
@@ -790,11 +811,11 @@ struct DataFlow {
 
   // The hop stages, in data-flow order. Set by Step 1.
   llvm::SmallVector<StageNode*, 2> chain;
-  // Where the data passes from one stage of producer -> chain -> consumer to
-  // the next. boundaries[k] is the path index of the first node after
-  // boundary k. Boundary 0 is between the producer and chain.front(), and
-  // boundary chain.size() is between chain.back() and the consumer. Empty
-  // when the chain is empty. Set by Step 1.
+  // The boundaries of the route. boundaries[k] is the path index of the
+  // first node of the stage that receives the data at boundary k. Boundary 0
+  // is from the producer to chain.front(), and boundary chain.size() is from
+  // chain.back() to the consumer. Empty when the chain is empty. Set by
+  // Step 1.
   llvm::SmallVector<size_t, 3> boundaries;
   // What carries the data across each boundary. Steps 2 and 3 fill it in.
   llvm::SmallVector<Carrier, 3> carriers;
@@ -906,17 +927,20 @@ static std::vector<DataFlow> collectDataFlows(
   return flows;
 }
 
-/// Find the routing-graph path of every flow, and work out which part of it
-/// belongs to which stage.
+/// Find the routing-graph path of every flow, and work out which of its nodes
+/// are part of the producer and which are part of the consumer.
 ///
-/// A stage owns the node for its own resource. A load-side stage also owns
-/// the load unit right after its memory, because that unit reads the memory.
-/// For the same reason a store-side stage owns the store unit right before
-/// its memory. These units later become the stages' applicable units.
+/// The path starts at the producer's resource and ends at the consumer's
+/// resource. A load-side producer's memory is read by a load unit, which
+/// comes right after the memory on the path; that unit is part of the
+/// producer too. A store-side consumer's memory is written by a store unit,
+/// which comes right before the memory; that unit is part of the consumer
+/// too. These units later become the stages' applicable units. See DataFlow
+/// for how stages, memories and units line up on a path.
 ///
 /// For example, take a load stage reading DDR that feeds a compute stage on
-/// SFU, with the path DDR -> MNILU -> L1 -> L1LU -> SFU. The load stage owns
-/// DDR and MNILU, the compute stage owns SFU, and L1 -> L1LU in the middle
+/// SFU, with the path DDR -> MNILU -> L1 -> L1LU -> SFU. The load stage is
+/// DDR read by MNILU, the compute stage is SFU, and L1 -> L1LU in the middle
 /// is a hop that needs a stage on L1LU.
 ///
 /// The path depends only on the resources of the two stages, so all flows
@@ -951,8 +975,8 @@ static mlir::LogicalResult routeDataFlows(
     size_t last = flow.path.size() - 1;
     flow.consumer_begin = last;
 
-    // A load-side producer owns the load unit right after its memory,
-    // unless that unit is the consumer's own resource.
+    // The load unit right after a load-side producer's memory is part of the
+    // producer, unless that unit is the consumer's own resource.
     if (sides.at(flow.producer) == StageSide::kLoad && last > 1 &&
         nodeAt(flow, 0).kind == RK::Memory &&
         nodeAt(flow, 1).kind == RK::LoadStoreUnit) {
@@ -960,8 +984,8 @@ static mlir::LogicalResult routeDataFlows(
       flow.producer_unit = nodeAt(flow, 1).resource;
     }
 
-    // A store-side consumer owns the store unit right before its memory,
-    // unless the producer already owns it.
+    // The store unit right before a store-side consumer's memory is part of
+    // the consumer, unless it is already part of the producer.
     if (sides.at(flow.consumer) == StageSide::kStore &&
         last > flow.producer_end + 1 && nodeAt(flow, last).kind == RK::Memory &&
         nodeAt(flow, last - 1).kind == RK::LoadStoreUnit) {
@@ -973,8 +997,8 @@ static mlir::LogicalResult routeDataFlows(
 }
 
 /// Return true if path expansion has to add stages: some path passes through
-/// a memory or compute unit that no stage owns. A load/store unit with no
-/// stage does not count on its own.
+/// a memory or compute unit that is part of neither the producer nor the
+/// consumer. A load/store unit with no stage does not count on its own.
 static bool needsExpansion(
     llvm::ArrayRef<DataFlow> flows,
     const scheduler::arch_view::RoutingGraph& arch_graph) {
@@ -1059,8 +1083,8 @@ static mlir::LogicalResult assignOriginalStageUnits(
 ///  1. The middle of the path is split into hops. A memory followed by the
 ///     load unit that reads it, or a store unit followed by the memory it
 ///     writes, is one hop that moves data through that memory. A load/store
-///     unit on its own is a hop with no memory. The places where one hop ends
-///     and the next begins are recorded as the flow's boundaries.
+///     unit on its own is a hop with no memory. The first path index of each
+///     hop and of the consumer is recorded as a boundary (see DataFlow).
 ///  2. Each hop is given to the stage that already runs on its unit, so that
 ///     no unit ever runs two stages. Only if no stage runs on the unit yet is
 ///     a new stage created for it. The existing stage may be an original
@@ -1271,9 +1295,9 @@ static mlir::LogicalResult orderStagesByDependencies(PipelineNode* pipeline) {
 //===----------------------------------------------------------------------===//
 
 namespace {
-/// What carries a flow's data across one boundary between two stages of
-/// producer -> chain -> consumer: a memory buffer, or a FIFO between two
-/// units. Exactly one of memory and fifo_src/fifo_dest is set.
+/// Where a flow's data is held at one boundary (see DataFlow): a buffer in a
+/// memory, or a FIFO between two units. Exactly one of memory and
+/// fifo_src/fifo_dest is set.
 struct BoundaryPlace {
   ResourceType memory;
   ResourceType fifo_src;
@@ -1293,24 +1317,26 @@ struct Tile {
 };
 }  // namespace
 
-/// Return the place that carries \p flow across boundary \p k. See
-/// DataFlow::boundaries.
+/// Return where \p flow's data is held at boundary \p k. See DataFlow.
 ///
-/// How it works: look at the last path node of the stage before the boundary
-/// and the first path node of the stage after it. If either is a memory, the
-/// data crosses in a buffer in that memory. Otherwise both are units, and the
-/// data crosses in a FIFO from the first unit to the second.
+/// How it works: the receiving stage starts at path index boundaries[k], and
+/// the sending stage ends just before it. If the receiving stage starts with
+/// its memory, it loads from that memory, and the data is held in a buffer
+/// there. Otherwise, if the sending stage ends with its memory, it stores
+/// into that memory, and the data is held in a buffer there. Otherwise the
+/// sending stage ends with its unit and the receiving stage starts with its
+/// unit, and the data is held in a FIFO between the two.
 static BoundaryPlace boundaryPlace(
     const DataFlow& flow, size_t k,
     const scheduler::arch_view::RoutingGraph& arch_graph) {
   using RK = scheduler::arch_view::RoutingGraph::ResourceNode::ResourceKind;
   size_t idx = flow.boundaries[k];
-  auto left = arch_graph.getNode(flow.path[idx - 1]);
-  auto right = arch_graph.getNode(flow.path[idx]);
-  assert(left && right && "node in path must exist in graph");
-  if (right->kind == RK::Memory) return {right->resource, {}, {}};
-  if (left->kind == RK::Memory) return {left->resource, {}, {}};
-  return {{}, left->resource, right->resource};
+  auto sender_last = arch_graph.getNode(flow.path[idx - 1]);
+  auto receiver_first = arch_graph.getNode(flow.path[idx]);
+  assert(sender_last && receiver_first && "node in path must exist in graph");
+  if (receiver_first->kind == RK::Memory) return {receiver_first->resource, {}, {}};
+  if (sender_last->kind == RK::Memory) return {sender_last->resource, {}, {}};
+  return {{}, sender_last->resource, receiver_first->resource};
 }
 
 /// Return the shape of the data that \p op moves on one side, the side that
