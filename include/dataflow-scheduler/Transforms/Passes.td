@@ -308,9 +308,42 @@ def AddressAssignmentPass : Pass<"address-assignment", "mlir::ModuleOp"> {
   ];
 }
 
+def AccessGranularityLegalizationPass
+    : Pass<"access-granularity-legalization", "mlir::ModuleOp"> {
+  let summary = "Enforce hardware physical access_granularity constraints on data_transfer ops";
+  let description = [{
+    Runs immediately after path-expansion and before splat-legalization.
+    Enforces hardware physical access_granularity constraints across all
+    ktdf.data_transfer operations (memory-to-memory and memory-to-FIFO),
+    independently of whether a broadcast/splat is involved.
+
+    For example, an MNILU transfer of [1, 1, 1, 1] may need to be widened to
+    [1, 1, 1, 64] to satisfy DDR bus alignment constraints.
+
+    Key responsibilities:
+      1. Source buffer bounds checking: when widening a load transfer the pass
+         inspects the source memref shape/allocation bounds and verifies the
+         innermost dimension is large enough to support the widened physical
+         read, or diagnoses unpadded small buffers that would cause
+         out-of-bounds reads.
+      2. Loads vs. stores: differentiates read widening (safe into padded
+         intermediate buffers) from write widening (requires hardware
+         byte-enables or masking).
+      3. Integration with padding modes: leverages ZeroPadFront / ZeroPadBack
+         transfer modes for sub-granule non-splat slices (boundary/tail tiles).
+  }];
+  let constructor = "::scheduler::createAccessGranularityLegalizationPass()";
+}
+
+// TODO(splat-and-access-granularity-legalization-plan): Retire this pass.
+// Memory-side transfer widening and hardware access granularity checking
+// (mustLegalizeLoad) have been moved to access-granularity-legalization.
+// The compute-side indexing map normalization and read_from_fifo type updates
+// that remain here should be folded into splat-legalization or direct
+// front-end lowering; once that is done this pass can be removed entirely.
 def ScalarBroadcastLegalizationPass
     : Pass<"scalar-broadcast-legalization", "mlir::ModuleOp"> {
-  let summary = "Legalize scalar broadcast inputs to linalg.generic compute ops";
+  let summary = "Legalize scalar broadcast inputs to linalg.generic compute ops (deprecated)";
   let description = [{
     Detects linalg.generic operations in compute stages that have input
     indexing maps with a constant in the vector dimension (scalar broadcast).
@@ -321,6 +354,11 @@ def ScalarBroadcastLegalizationPass
       2. Marking the L1->FIFO transfer as a splat.
       3. Updating read_from_fifo result type and linalg.generic indexing map
          to use the full vector identity map.
+
+    Deprecated: memory-side transfer widening is being moved to
+    access-granularity-legalization. This pass will be retired once the
+    remaining compute-side responsibilities are folded into splat-legalization
+    or front-end lowering.
   }];
   let constructor = "::scheduler::createScalarBroadcastLegalizationPass()";
 }
