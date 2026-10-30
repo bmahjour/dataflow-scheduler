@@ -16,19 +16,22 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// SplatLegalization: legalize splat data_transfer loads to the arch's load
-// granularity, and name the shuffle that finishes the splat on the reads.
+// SplatLegalization: validate splat data_transfer loads against the load
+// unit's SIMD capabilities, widen the load to the arch's access granularity
+// when required, and annotate consuming read_from_fifo ops with the sub-SIMD
+// shuffle mode that closes the gap.
 //
-// A splat whose load unit cannot splat is moved down its path, to the first
-// transfer into a FIFO whose load unit can.  The transfers it passes become
-// copies of the source, and the buffers and slots between them shrink to it.
+// Problem this pass addresses: A load unit that cannot splat a single element
+// at its access granularity loads the whole granule instead, which leaves one
+// live element per sub-SIMD group rather than one for the whole vector.
 //
-// A load unit that cannot splat a single element at its access granularity
-// loads the whole granule instead, which leaves one live element per sub-SIMD
-// group rather than one for the whole vector.  The pass records that on the
-// read as the splat mode that closes the gap, and stops there: the shuffle
-// itself is emitted by the lowering to DFIR, and where the buffer it works on
-// lives is the device's to say through its patterns.
+// This pass's responsibilities are:
+//   1. Validate that the load unit's SIMD feature declares splat capability.
+//   2. Widen the innermost static_source_sizes dimension to the hardware's
+//      access granularity when it exceeds the requested element count.
+//   3. Annotate each consuming ktdf.read_from_fifo with
+//      #ktdf.splat<first_subsimd_lane_to_each_subsimd> when widening occurred,
+//      naming the sub-SIMD broadcast shuffle the lowering to DFIR will emit.
 //
 //===----------------------------------------------------------------------===//
 
@@ -82,98 +85,17 @@ scheduler::ResourceType resolveLoadUnitKind(mlir::Operation* op) {
       .value_or(scheduler::ResourceType{});
 }
 
-/// Returns whether the load unit of @p transfer can splat.
-bool canSplat(mlir::ktdf::DataTransferOp transfer,
-              const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+/// Validate that @p transfer's load unit declares splat capability.
+static mlir::LogicalResult validateSplatCapability(
+    mlir::ktdf::DataTransferOp transfer,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
   const auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(
       resolveLoadUnitKind(transfer));
-  return simd && simd.canSplat();
-}
-
-/// Returns the single transfer that reads @p value , or nullptr if there is
-/// not exactly one.
-mlir::ktdf::DataTransferOp getSingleReader(mlir::Value value) {
-  mlir::ktdf::DataTransferOp reader;
-  for (mlir::Operation* user : value.getUsers()) {
-    auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(user);
-    if (!transfer || transfer.getSource() != value) {
-      continue;
-    }
-    if (reader) {
-      return nullptr;
-    }
-    reader = transfer;
-  }
-  return reader;
-}
-
-/// Moves the splat of @p transfer down its path to the first transfer into a
-/// FIFO whose load unit can splat, and returns that transfer.  The transfers
-/// before it become copies of the source, and the buffers and slots they write
-/// shrink to its shape.  Returns @p transfer if its load unit can splat.
-mlir::FailureOr<mlir::ktdf::DataTransferOp> moveSplat(
-    mlir::RewriterBase& rewriter, mlir::ktdf::DataTransferOp transfer,
-    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
-  if (canSplat(transfer, resource_kinds)) {
-    return transfer;
-  }
-
-  // Find the transfer that can splat, collecting the ones before it.
-  llvm::SmallVector<mlir::ktdf::DataTransferOp> path{transfer};
-  mlir::ktdf::DataTransferOp target;
-  for (auto next = getSingleReader(transfer.getDestination()); next;
-       next = getSingleReader(next.getDestination())) {
-    if (next.getTransferMode() != mlir::ktdf::TransferMode::Copy) {
-      break;
-    }
-    if (next.isDestFifo() && canSplat(next, resource_kinds)) {
-      target = next;
-      break;
-    }
-    path.push_back(next);
-  }
-  if (!target) {
+  if (!simd || !simd.canSplat())
     return transfer.emitError(
         "splat data_transfer requires the load unit to declare "
         "ktdf_arch.feature.simd = { splat, ... }");
-  }
-
-  const auto static_src_sizes = transfer.getStaticSourceSizesArray();
-  if (!static_src_sizes) {
-    return transfer.emitError(
-        "splat data_transfer requires static source sizes to move it");
-  }
-  const int64_t num_elements =
-      std::accumulate(static_src_sizes->begin(), static_src_sizes->end(),
-                      int64_t{1}, std::multiplies<>());
-
-  LDBG(1) << "moving splat of " << transfer << " to " << target;
-
-  // Every destination on the way only has to hold the source.
-  for (auto hop : path) {
-    const mlir::Value dest = hop.getDestination();
-    const bool resized =
-        hop.isDestFifo()
-            ? mlir::ktdf::resizePrivateFifoSlot(rewriter, dest, num_elements)
-            : mlir::ktdf::resizePrivateBuffer(rewriter, dest,
-                                              *static_src_sizes);
-    if (!resized) {
-      return hop.emitError("cannot shrink the destination of a moved splat");
-    }
-
-    rewriter.modifyOpInPlace(hop, [&] {
-      hop.setTransferMode(mlir::ktdf::TransferMode::Copy);
-      hop.setStaticDestSizes(*static_src_sizes);
-      if (hop != transfer) {
-        hop.setStaticSourceSizes(*static_src_sizes);
-      }
-    });
-  }
-  rewriter.modifyOpInPlace(target, [&] {
-    target.setStaticSourceSizes(*static_src_sizes);
-    target.setTransferMode(mlir::ktdf::TransferMode::Splat);
-  });
-  return target;
+  return mlir::success();
 }
 
 /// Legalize `transfer`'s load to the arch's access granularity and name, on
@@ -246,7 +168,6 @@ struct SplatLegalizationPass
     auto& resource_kinds =
         device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
-    // Moving a splat rewrites the IR around it, so collect them first.
     llvm::SmallVector<mlir::ktdf::DataTransferOp> splats;
     module_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
       if (transfer.isDestFifo() &&
@@ -256,9 +177,9 @@ struct SplatLegalizationPass
 
     mlir::IRRewriter rewriter(&getContext());
     for (auto transfer : splats) {
-      const auto target = moveSplat(rewriter, transfer, resource_kinds);
-      if (mlir::failed(target) || mlir::failed(legalizeSplatTransfer(
-                                      rewriter, *target, resource_kinds))) {
+      if (mlir::failed(validateSplatCapability(transfer, resource_kinds)) ||
+          mlir::failed(
+              legalizeSplatTransfer(rewriter, transfer, resource_kinds))) {
         signalPassFailure();
         return;
       }

@@ -355,13 +355,10 @@ def IndirectAddrBufFillLegalizationPass
 }
 
 def SplatLegalizationPass : Pass<"splat-legalization", "mlir::ModuleOp"> {
-  let summary = "Legalize splat data_transfer loads and name the shuffle that finishes them";
+  let summary = "Validate splat loads, widen to access granularity, and name the sub-SIMD shuffle";
   let description = [{
-    Runs after ScalarBroadcastLegalizationPass and records, in the IR, that a
-    splat the hardware cannot perform in one step has been left half done.
-
-    For each ktdf.data_transfer with a splat transfer mode whose destination is
-    a FIFO:
+    Runs after access-granularity-legalization. For each ktdf.data_transfer
+    with a splat transfer mode whose destination is a FIFO:
 
       1. Validates that the load unit's SIMD feature declares the splat
          capability.
@@ -381,10 +378,9 @@ def SplatLegalizationPass : Pass<"splat-legalization", "mlir::ModuleOp"> {
     gap; it is the pass's durable output.
 
     The shuffle itself is emitted by the lowering to DFIR, which reads the group
-    width off the compute unit's sub_simd_lanes.  What the buffer it works on is
-    and where it lives stays the device's to decide, in its
-    patterns ["post_scheduling"] block.  This pass queries the arch for the load
-    width and nothing else.
+    width off the compute unit's sub_simd_lanes.  This pass queries the arch for
+    the load width and nothing else.  Splat placement (ensuring the splat lands
+    on the terminal FIFO load) is the responsibility of path expansion upstream.
   }];
   let constructor = "::scheduler::createSplatLegalizationPass()";
   let dependentDialects = [
