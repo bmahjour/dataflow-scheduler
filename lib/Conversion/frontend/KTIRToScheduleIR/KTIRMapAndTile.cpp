@@ -462,8 +462,8 @@ struct BubbleUpSliceThroughReshape
   }
 };
 
-/// Index the innermost dimension of @p operand by the innermost loop rather than
-/// by the constant that addressed its single element.
+/// Index the innermost dimension of @p operand by the innermost loop rather
+/// than by the constant that addressed its single element.
 ///
 /// The map carries that constant on entry because it is how the front end
 /// expresses a broadcast, and what finds the dimension to widen. It stops being
@@ -471,8 +471,8 @@ struct BubbleUpSliceThroughReshape
 /// that element across the dimension, so this is only to be called right after
 /// such a widening. The innermost loop must also be what the dimension spans: a
 /// parallel loop whose extent is the dimension's size, and that no other
-/// dimension of the operand is indexed by. Otherwise the constant is kept, which
-/// reads the same element.
+/// dimension of the operand is indexed by. Otherwise the constant is kept,
+/// which reads the same element.
 ///
 /// @return Whether the indexing map changed.
 [[nodiscard]] auto legalizeBroadcastMap(mlir::linalg::GenericOp op,
