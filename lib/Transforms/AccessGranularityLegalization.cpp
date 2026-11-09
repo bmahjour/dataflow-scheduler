@@ -148,6 +148,10 @@ static int64_t computeRequiredLoadElements(
 /// Widen the innermost source and destination sizes of @p transfer from
 /// @p src_elements to @p required_elements.  For a memref destination,
 /// resizes the backing alloc.  For a FIFO destination, resizes the slot.
+/// A splat transfer broadcasts the source into a destination of unrelated
+/// size, so there only the source is always widened; the destination is
+/// widened (and its storage resized) only if it is smaller than
+/// @p required_elements.
 /// Returns failure and emits a diagnostic if resizing is not possible.
 static mlir::LogicalResult widenTransfer(mlir::RewriterBase& rewriter,
                                          mlir::ktdf::DataTransferOp transfer,
@@ -161,6 +165,10 @@ static mlir::LogicalResult widenTransfer(mlir::RewriterBase& rewriter,
 
   // Widen the destination sizes and resize the backing storage.
   auto dest_sizes_opt = transfer.getStaticDestSizesArray();
+  if (transfer.getTransferMode() == mlir::ktdf::TransferMode::Splat &&
+      dest_sizes_opt && !dest_sizes_opt->empty() &&
+      dest_sizes_opt->back() >= required_elements)
+    return mlir::success();
   if (dest_sizes_opt) {
     llvm::SmallVector<int64_t> new_dest(*dest_sizes_opt);
     new_dest.back() = required_elements;
