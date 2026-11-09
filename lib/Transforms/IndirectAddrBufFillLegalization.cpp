@@ -113,6 +113,24 @@ bool unitConnects(const RoutingGraph& graph, ResourceType unit_kind,
   return false;
 }
 
+/// The distinct load/store units that can carry data from \p source to
+/// \p dest , in graph order.
+llvm::SmallVector<ResourceType> loadStoreUnitsConnecting(
+    const RoutingGraph& graph, ResourceType source, ResourceType dest) {
+  llvm::SmallSetVector<ResourceType, 4> result;
+  for (RoutingGraph::NodeId candidate : graph.getAllNodeIds()) {
+    auto node = graph.getNode(candidate);
+    if (!node ||
+        node->kind != RoutingGraph::ResourceNode::ResourceKind::LoadStoreUnit) {
+      continue;
+    }
+    if (unitConnects(graph, node->resource, source, dest)) {
+      result.insert(node->resource);
+    }
+  }
+  return result.takeVector();
+}
+
 /// The single unit \p stage is mapped to, or null if it is not mapped to
 /// exactly one.
 ResourceType getStageUnit(mlir::ktdf::StageOp stage) {
@@ -170,11 +188,13 @@ mlir::AffineMap createZeroSubscript(int64_t rank, mlir::MLIRContext* ctx) {
   return mlir::AffineMap::get(/*dimCount=*/0, /*symbolCount=*/0, zeros, ctx);
 }
 
-/// Adds a buffer of \p type to \p pipeline 's private resources and returns the
-/// result handing it out. The private op is rebuilt, since results cannot be
-/// appended to an existing operation.
-mlir::Value appendPrivateBuffer(mlir::ktdf::PipelineOp pipeline,
-                                mlir::MemRefType type) {
+/// Adds a resource of \p type to \p pipeline 's private resources and returns
+/// the result handing it out. \p create builds the yielded value inside the
+/// private region. The private op is rebuilt, since results cannot be appended
+/// to an existing operation.
+mlir::Value appendPrivateResource(
+    mlir::ktdf::PipelineOp pipeline, mlir::Type type,
+    llvm::function_ref<mlir::Value(mlir::OpBuilder&, mlir::Location)> create) {
   mlir::ktdf::PrivateOp private_op = pipeline.getPrivateOp();
   assert(private_op && "pipeline must have a private region");
 
@@ -188,10 +208,10 @@ mlir::Value appendPrivateBuffer(mlir::ktdf::PipelineOp pipeline,
 
   mlir::ktdf::PrivateYieldOp yield = new_private.getYieldOp();
   builder.setInsertionPoint(yield);
-  auto alloc = mlir::memref::AllocOp::create(builder, yield.getLoc(), type);
+  mlir::Value resource = create(builder, yield.getLoc());
 
   llvm::SmallVector<mlir::Value> yield_operands(yield.getOperands());
-  yield_operands.push_back(alloc.getResult());
+  yield_operands.push_back(resource);
   mlir::ktdf::PrivateYieldOp::create(builder, yield.getLoc(), yield_operands);
   yield.erase();
 
@@ -202,6 +222,38 @@ mlir::Value appendPrivateBuffer(mlir::ktdf::PipelineOp pipeline,
   private_op.erase();
 
   return new_private.getResults().back();
+}
+
+/// Adds a buffer of \p type to \p pipeline 's private resources.
+mlir::Value appendPrivateBuffer(mlir::ktdf::PipelineOp pipeline,
+                                mlir::MemRefType type) {
+  return appendPrivateResource(
+      pipeline, type, [&](mlir::OpBuilder& builder, mlir::Location loc) {
+        return mlir::memref::AllocOp::create(builder, loc, type).getResult();
+      });
+}
+
+/// Adds a stage mapped to \p unit at the start of \p pipeline , ahead of every
+/// other stage. It completes by signalling a fresh private token, which
+/// \p dependent is made to wait on.
+mlir::ktdf::StageOp createStagingStage(mlir::ktdf::PipelineOp pipeline,
+                                       mlir::ktdf::StageOp dependent,
+                                       ResourceType unit) {
+  auto token_type = mlir::ktdf::TokenType::get(pipeline.getContext());
+  mlir::Value token = appendPrivateResource(
+      pipeline, token_type, [&](mlir::OpBuilder& builder, mlir::Location loc) {
+        return mlir::ktdf::CreateTokenOp::create(builder, loc).getResult();
+      });
+
+  mlir::OpBuilder builder(*pipeline.getStages().begin());
+  auto staging_stage = mlir::ktdf::StageOp::create(
+      builder, dependent.getLoc(), /*depends_in=*/mlir::ValueRange{},
+      /*depends_out=*/mlir::ValueRange{token});
+  staging_stage.setApplicableUnitsAttr(builder.getArrayAttr({unit}));
+
+  dependent.addInDependency(
+      mlir::cast<mlir::TypedValue<mlir::ktdf::TokenType>>(token));
+  return staging_stage;
 }
 
 /// Makes \p value available at \p builder 's insertion point. Values defined
@@ -342,12 +394,27 @@ mlir::LogicalResult legalizeFillSite(const FillSite& site,
   }
   ResourceType staging_memory = reachable.front();
 
+  // Prefer an existing earlier stage; failing that, add one on a unit that can
+  // carry the data, e.g. when every input already lives in the staging memory
+  // and the pipeline has no load stage of its own.
   mlir::ktdf::StageOp staging_stage =
       findStagingStage(pipeline, stage, graph, source_memory, staging_memory);
+  ResourceType new_stage_unit = nullptr;
   if (!staging_stage) {
-    return fill.emitError()
-           << PASS_NAME << ": no earlier stage can carry the index data from "
-           << source_memory << " to " << staging_memory;
+    llvm::SmallVector<ResourceType> units =
+        loadStoreUnitsConnecting(graph, source_memory, staging_memory);
+    if (units.empty()) {
+      return fill.emitError()
+             << PASS_NAME << ": no unit can carry the index data from "
+             << source_memory << " to " << staging_memory;
+    }
+    if (units.size() != 1) {
+      return fill.emitError()
+             << PASS_NAME << ": " << units.size()
+             << " units can carry the index data from " << source_memory
+             << " to " << staging_memory << ", expected exactly one";
+    }
+    new_stage_unit = units.front();
   }
 
   const auto buffer_shape = fill.getStaticSourceSizesArray();
@@ -367,16 +434,21 @@ mlir::LogicalResult legalizeFillSite(const FillSite& site,
   llvm::SmallVector<mlir::scf::IfOp> guards;
   if (mlir::failed(collectGuards(fill, stage, guards))) return mlir::failure();
 
-  LDBG(1) << "  staging fill of " << dest_memory << " through "
-          << staging_memory << " in stage on " << getStageUnit(staging_stage);
-
   mlir::MLIRContext* ctx = fill.getContext();
   auto buffer_type =
       mlir::MemRefType::get(*buffer_shape, source_type.getElementType(),
                             mlir::MemRefLayoutAttrInterface(), staging_memory);
   mlir::AffineMap buffer_subscript =
       createZeroSubscript(buffer_type.getRank(), ctx);
+
+  // Rebuilding the private op invalidates the values it handed out earlier, so
+  // the stage's token is added before the buffer is requested.
+  if (!staging_stage) {
+    staging_stage = createStagingStage(pipeline, stage, new_stage_unit);
+  }
   mlir::Value buffer = appendPrivateBuffer(pipeline, buffer_type);
+  LDBG(1) << "  staging fill of " << dest_memory << " through "
+          << staging_memory << " in stage on " << getStageUnit(staging_stage);
 
   // The source -> staging copy, under the fill's own guards so that it only
   // runs on the iterations the fill needs it.
