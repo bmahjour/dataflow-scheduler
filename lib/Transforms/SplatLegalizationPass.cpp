@@ -124,14 +124,13 @@ static mlir::LogicalResult checkSourceFitsWiderLoad(
       llvm::SmallVector<mlir::Attribute> operands;
       for (mlir::Value index : indices) {
         auto constant = mlir::getConstantIntValue(index);
-        operands.push_back(constant ? mlir::IntegerAttr::get(
-                                          index.getType(), *constant)
-                                    : mlir::Attribute{});
+        operands.push_back(
+            constant ? mlir::IntegerAttr::get(index.getType(), *constant)
+                     : mlir::Attribute{});
       }
       llvm::SmallVector<mlir::Attribute> results;
-      if (mlir::succeeded(
-              map->getSliceMap(map->getNumResults() - 1, 1)
-                  .constantFold(operands, results)) &&
+      if (mlir::succeeded(map->getSliceMap(map->getNumResults() - 1, 1)
+                              .constantFold(operands, results)) &&
           !results.empty()) {
         if (auto constant = mlir::dyn_cast<mlir::IntegerAttr>(results.front()))
           start = constant.getInt();
