@@ -23,29 +23,33 @@
 // all physical execution units and intermediate memory tiers are fully
 // instantiated and concrete.
 //
-// Problem this pass addresses: a hardware load unit may only be able to issue
-// transfers whose size is a multiple of some minimum bus granularity.  For
-// example, an MNILU can only read 64-element chunks from DDR, so a transfer
-// of [1, 1, 1, 1] must be widened to [1, 1, 1, 64] -- both source and
-// destination sizes -- and the destination buffer must be resized to match.
+// Problem this pass addresses: hardware load/store units may only be able to
+// issue transfers whose size is a multiple of some minimum bus granularity.
+// For example, an MNILU can only read 64-element chunks from DDR, so a load
+// transfer of [1, 1, 1, 1] must be widened to [1, 1, 1, 64] -- both source and
+// destination sizes -- and the destination buffer resized to match. Similarly,
+// store units must satisfy physical store granularity constraints.
 //
 // This pass's responsibilities are:
-//   1. For each ktdf.data_transfer whose source is a memref (load), query the
-//      load unit's access_granularity for the source memory space and compute
-//      the smallest legal transfer size that covers all requested elements.
-//   2. When widening is needed, update the innermost static_source_sizes and
-//      static_dest_sizes dimensions, and resize the destination buffer or FIFO
-//      slot accordingly.
-//   3. Skips transfers with dynamic sizes, non-memref sources (FIFO-to-memref),
-//      and stages with no unambiguous load unit (no applicable_units).
-//   4. Skips splat transfers.  A splat's source size says how many elements
-//      the program wants copied, and splat-legalization needs that number to
-//      tell whether the hardware will load more than was asked for.  Widening
-//      it here would hide that, so splat-legalization widens splats itself.
+//   1. For load transfers (source is a memref): query the load unit's
+//      access_granularity for the source memory space, compute the smallest
+//      fitting legal transfer size, annotate `dataflow_scheduler.access_granularity`,
+//      and widen innermost dimensions and destination buffers/slots as needed.
+//   2. For store transfers (destination is a memref): query the store unit's
+//      access_granularity for the destination memory space, annotate
+//      `dataflow_scheduler.access_granularity`, and verify the store satisfies
+//      the hardware granularity without requiring write-widening (or emit a
+//      diagnostic error).
+//   3. Skips transfers with dynamic sizes, non-memref endpoints, and stages
+//      with no unambiguous unit (no applicable_units).
+//   4. Skips splat widening. A splat's source size indicates how many elements
+//      the program requested, which splat-legalization needs to determine
+//      hardware load overfetch. Splat-legalization handles widening splats
+//      itself.
 //
 // Notes on scope:
 //   - Only load (read) widening is handled here; write widening requires
-//     hardware per-byte write-mask support and is not yet implemented.
+//     hardware per-byte write-mask support and is diagnosed as an error.
 //   - Source buffer bounds checking (verifying the source memref is large
 //     enough to support the widened physical read) is a TODO.
 //   - Integration with ZeroPadFront / ZeroPadBack for boundary tiles is a TODO.
@@ -170,6 +174,34 @@ static mlir::LogicalResult widenTransfer(mlir::RewriterBase& rewriter,
   return mlir::success();
 }
 
+struct MemRefTransferInfo {
+  int64_t elements;
+  int64_t required_elements;
+};
+
+/// Computes the requested and required elements for a memref operand given its
+/// static transfer sizes and target unit feature.
+template <typename FeatureT>
+static std::optional<MemRefTransferInfo> getMemRefTransferGranularity(
+    mlir::Value memref, std::optional<llvm::ArrayRef<int64_t>> static_sizes,
+    FeatureT feature) {
+  if (!static_sizes || static_sizes->empty()) return std::nullopt;
+
+  auto memref_type = mlir::dyn_cast<mlir::MemRefType>(memref.getType());
+  if (!memref_type) return std::nullopt;
+
+  mlir::Attribute memory_space = memref_type.getMemorySpace();
+  if (!memory_space) return std::nullopt;
+
+  const int64_t elements =
+      std::accumulate(static_sizes->begin(), static_sizes->end(), int64_t{1},
+                      std::multiplies<>());
+  const int64_t required_elements = computeGranularity(
+      elements, memref_type.getElementType(), memory_space, feature);
+
+  return MemRefTransferInfo{elements, required_elements};
+}
+
 /// Inspect @p transfer and set/widen its access granularity to the unit's
 /// hardware constraints.
 static mlir::LogicalResult legalizeTransfer(
@@ -184,33 +216,21 @@ static mlir::LogicalResult legalizeTransfer(
               unit_kind)) {
     if (!transfer.isSourceMemRef()) return mlir::success();
 
-    auto static_src_sizes = transfer.getStaticSourceSizesArray();
-    if (!static_src_sizes || static_src_sizes->empty()) return mlir::success();
+    auto info = getMemRefTransferGranularity(
+        transfer.getSource(), transfer.getStaticSourceSizesArray(),
+        load_feature);
+    if (!info) return mlir::success();
 
-    const int64_t src_elements =
-        std::accumulate(static_src_sizes->begin(), static_src_sizes->end(),
-                        int64_t{1}, std::multiplies<>());
-
-    auto src_memref_type =
-        mlir::cast<mlir::MemRefType>(transfer.getSource().getType());
-    mlir::Type elem_type = src_memref_type.getElementType();
-    mlir::Attribute memory_space = src_memref_type.getMemorySpace();
-    if (!memory_space) return mlir::success();
-
-    const int64_t required_elements =
-        computeGranularity(src_elements, elem_type, memory_space, load_feature);
-
-    // Set/refine the access granularity attribute on the transfer before any
-    // skipping.
-    scheduler::setAccessGranularity(transfer, required_elements);
+    // Set/refine the access granularity attribute on the transfer.
+    scheduler::setAccessGranularity(transfer, info->required_elements);
 
     // Leave splat widening to splat-legalization.
     if (transfer.getTransferMode() == mlir::ktdf::TransferMode::Splat)
       return mlir::success();
 
-    if (required_elements <= src_elements) return mlir::success();
+    if (info->required_elements <= info->elements) return mlir::success();
 
-    return widenTransfer(rewriter, transfer, required_elements);
+    return widenTransfer(rewriter, transfer, info->required_elements);
   }
 
   // Handle units with store feature (memref destination).
@@ -219,32 +239,21 @@ static mlir::LogicalResult legalizeTransfer(
               unit_kind)) {
     if (!transfer.isDestMemRef()) return mlir::success();
 
-    auto static_dst_sizes = transfer.getStaticDestSizesArray();
-    if (!static_dst_sizes || static_dst_sizes->empty()) return mlir::success();
+    auto info = getMemRefTransferGranularity(transfer.getDestination(),
+                                             transfer.getStaticDestSizesArray(),
+                                             store_feature);
+    if (!info) return mlir::success();
 
-    const int64_t dst_elements =
-        std::accumulate(static_dst_sizes->begin(), static_dst_sizes->end(),
-                        int64_t{1}, std::multiplies<>());
-
-    auto dst_memref_type =
-        mlir::cast<mlir::MemRefType>(transfer.getDestination().getType());
-    mlir::Type elem_type = dst_memref_type.getElementType();
-    mlir::Attribute memory_space = dst_memref_type.getMemorySpace();
-    if (!memory_space) return mlir::success();
-
-    const int64_t required_elements = computeGranularity(
-        dst_elements, elem_type, memory_space, store_feature);
-
-    if (required_elements > dst_elements) {
+    if (info->required_elements > info->elements) {
       return transfer.emitError()
-             << "store transfer of " << dst_elements
+             << "store transfer of " << info->elements
              << " elements cannot satisfy the hardware store access "
                 "granularity of "
-             << required_elements << " elements without write-widening";
+             << info->required_elements << " elements without write-widening";
     }
 
     // Set/refine the access granularity attribute on the store transfer.
-    scheduler::setAccessGranularity(transfer, required_elements);
+    scheduler::setAccessGranularity(transfer, info->required_elements);
     return mlir::success();
   }
 
