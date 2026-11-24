@@ -60,6 +60,7 @@
 #include "dataflow-scheduler/Analysis/Mapping.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
@@ -114,41 +115,6 @@ static scheduler::ResourceType resolveLoadUnitKind(
 /// This correctly handles both small-word units (e.g. L1LU, word_size=1)
 /// and large-word units (e.g. L3LU, word_size=128), where one bus word
 /// spans many elements.
-static int64_t computeRequiredLoadElements(
-    int64_t src_elements, mlir::Type elem_type, mlir::Attribute memory_space,
-    scheduler::ResourceType unit_kind,
-    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
-  if (!unit_kind || !memory_space) return src_elements;
-
-  auto load_feature =
-      resource_kinds.getFeature<mlir::ktdf_arch::feature::Load>(unit_kind);
-  if (!load_feature) return src_elements;
-
-  auto granularity_list = load_feature.getAccessGranularity(memory_space);
-  if (!granularity_list) return src_elements;
-
-  const size_t word_size = load_feature.getWordSize(memory_space);
-  if (word_size == 0) return src_elements;
-
-  const size_t elem_bytes =
-      (static_cast<size_t>(elem_type.getIntOrFloatBitWidth()) + 7) / 8;
-  if (elem_bytes == 0) return src_elements;
-
-  // How many bus words are needed to cover all requested bytes?
-  const size_t bytes_requested = static_cast<size_t>(src_elements) * elem_bytes;
-  const size_t words_requested = (bytes_requested + word_size - 1) / word_size;
-
-  auto best = granularity_list.fitAccess(words_requested);
-  if (!best) return src_elements;
-
-  // Convert the granule back to elements.  word_size is expected to be a
-  // multiple of elem_bytes (or vice versa) for any real hardware type.
-  const size_t granule_bytes = best.getSizeInWords() * word_size;
-  const int64_t granule_elements =
-      static_cast<int64_t>(granule_bytes / elem_bytes);
-  return std::max(granule_elements, src_elements);
-}
-
 /// Widen the innermost source and destination sizes of @p transfer from
 /// @p src_elements to @p required_elements.  For a memref destination,
 /// resizes the backing alloc.  For a FIFO destination, resizes the slot.
@@ -215,9 +181,37 @@ static mlir::LogicalResult legalizeTransfer(
   mlir::Attribute memory_space = src_memref_type.getMemorySpace();
 
   scheduler::ResourceType unit_kind = resolveLoadUnitKind(transfer);
+  if (!unit_kind || !memory_space) return mlir::success();
 
-  const int64_t required_elements = computeRequiredLoadElements(
-      src_elements, elem_type, memory_space, unit_kind, resource_kinds);
+  auto load_feature =
+      resource_kinds.getFeature<mlir::ktdf_arch::feature::Load>(unit_kind);
+  if (!load_feature) return mlir::success();
+
+  auto granularity_list = load_feature.getAccessGranularity(memory_space);
+  if (!granularity_list) return mlir::success();
+
+  const size_t word_size = load_feature.getWordSize(memory_space);
+  if (word_size == 0) return mlir::success();
+
+  const size_t elem_bytes =
+      (static_cast<size_t>(elem_type.getIntOrFloatBitWidth()) + 7) / 8;
+  if (elem_bytes == 0) return mlir::success();
+
+  // How many bus words are needed to cover all requested bytes?
+  const size_t bytes_requested = static_cast<size_t>(src_elements) * elem_bytes;
+  const size_t words_requested = (bytes_requested + word_size - 1) / word_size;
+
+  auto best = granularity_list.fitAccess(words_requested);
+  const int64_t required_elements = [&] {
+    if (!best) return src_elements;
+    const size_t granule_bytes = best.getSizeInWords() * word_size;
+    const int64_t granule_elements =
+        static_cast<int64_t>(granule_bytes / elem_bytes);
+    return std::max(granule_elements, src_elements);
+  }();
+
+  // Refine the access granularity attribute on the transfer.
+  scheduler::setAccessGranularity(transfer, required_elements);
 
   if (required_elements <= src_elements) return mlir::success();
 

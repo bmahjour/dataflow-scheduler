@@ -183,9 +183,9 @@ namespace {
       .getResult();
 }
 
-/// The throttle of a store that fills an indirect address buffer: entries are
-/// written one at a time.
-constexpr int64_t kIndAddrBufFillThrottle = 1;
+/// The access granularity of a store that fills an indirect address buffer:
+/// entries are written one at a time.
+constexpr int64_t kIndAddrBufFillAccessGranularity = 1;
 
 /// Determines whether @p access_tile is over an indirect address buffer, i.e.
 /// over a `ktdp_lowering.construct_memory_view` (which carries the arch-graph
@@ -197,41 +197,42 @@ constexpr int64_t kIndAddrBufFillThrottle = 1;
              .getDefiningOp<mlir::ktdp_lowering::ConstructMemoryViewOp>();
 }
 
-/// Gets the minimum throttle of the ops consuming @p value , looking through
-/// `tensor.(collapse|expand)_shape`.
-[[nodiscard]] int64_t getConsumerThrottle(mlir::Value value) {
+/// Gets the minimum access granularity of the ops consuming @p value , looking
+/// through `tensor.(collapse|expand)_shape`.
+[[nodiscard]] int64_t getConsumerAccessGranularity(mlir::Value value) {
   auto result = std::numeric_limits<int64_t>::max();
   for (auto* user : value.getUsers()) {
     result = std::min(
         result,
         mlir::isa<mlir::tensor::CollapseShapeOp, mlir::tensor::ExpandShapeOp>(
             user)
-            ? getConsumerThrottle(user->getResult(0))
-            : getThrottle(user));
+            ? getConsumerAccessGranularity(user->getResult(0))
+            : getAccessGranularity(user));
   }
   return result;
 }
 
-/// Gets the throttle of the op producing @p value , looking through
+/// Gets the access granularity of the op producing @p value , looking through
 /// `tensor.(collapse|expand)_shape`.
-[[nodiscard]] int64_t getProducerThrottle(mlir::Value value) {
+[[nodiscard]] int64_t getProducerAccessGranularity(mlir::Value value) {
   while (auto* op = value.getDefiningOp()) {
     if (!mlir::isa<mlir::tensor::CollapseShapeOp, mlir::tensor::ExpandShapeOp>(
             op))
-      return getThrottle(op);
+      return getAccessGranularity(op);
     value = op->getOperand(0);
   }
   return std::numeric_limits<int64_t>::max();
 }
 
 /// Copies the discardable attributes of @p from onto @p to . If that leaves
-/// @p to without a throttle, uses @p fallback , unless it is unknown.
-void copyAttrsAndThrottle(mlir::Operation* from, mlir::Operation* to,
-                          int64_t fallback) {
+/// @p to without an access granularity, uses @p fallback , unless it is
+/// unknown.
+void copyAttrsAndAccessGranularity(mlir::Operation* from, mlir::Operation* to,
+                                   int64_t fallback) {
   to->setDiscardableAttrs(from->getRawDictionaryAttrs());
-  if (!to->hasAttr(kThrottleAttrName) &&
+  if (!to->hasAttr(kAccessGranularityAttrName) &&
       fallback != std::numeric_limits<int64_t>::max()) {
-    setThrottle(to, fallback);
+    setAccessGranularity(to, fallback);
   }
 }
 
@@ -349,7 +350,8 @@ struct LowerLoad : mlir::OpRewritePattern<mlir::ktdp::LoadOp> {
         rewriter, load.getLoc(), source, mixed_offsets, mixed_sizes,
         mixed_strides, result_type.getElementType());
     // Like a tiled load, transfer at the rate of the consuming computes.
-    copyAttrsAndThrottle(load, new_load, getConsumerThrottle(load.getResult()));
+    copyAttrsAndAccessGranularity(
+        load, new_load, getConsumerAccessGranularity(load.getResult()));
     rewriter.replaceOp(load, new_load);
 
     // Erase the tile op if it has no remaining users.
@@ -419,10 +421,11 @@ struct LowerStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
         rewriter, store.getLoc(), store.getDataTile(), dest, mixed_offsets,
         mixed_sizes, mixed_strides);
     // Like a tiled store, transfer at the rate of the producing compute.
-    copyAttrsAndThrottle(store, new_store,
-                         isIndAddrBufTile(store.getAccessTile())
-                             ? kIndAddrBufFillThrottle
-                             : getProducerThrottle(store.getDataTile()));
+    copyAttrsAndAccessGranularity(
+        store, new_store,
+        isIndAddrBufTile(store.getAccessTile())
+            ? kIndAddrBufFillAccessGranularity
+            : getProducerAccessGranularity(store.getDataTile()));
     rewriter.eraseOp(store);
 
     // Erase the tile op if it has no remaining users.
@@ -992,8 +995,8 @@ struct LowerIndirectLoad : mlir::OpRewritePattern<LoadOpT> {
         rewriter, loc, result_type, iab_view, info.iab_index, base_view,
         info.offsets, info.sizes, info.strides);
     // Like a direct load, transfer at the rate of the consuming computes.
-    copyAttrsAndThrottle(load, ind_load,
-                         getConsumerThrottle(load->getResult(0)));
+    copyAttrsAndAccessGranularity(
+        load, ind_load, getConsumerAccessGranularity(load->getResult(0)));
 
     rewriter.replaceOp(load, ind_load.getResult());
 
@@ -1078,7 +1081,8 @@ struct LowerIndirectStore : mlir::OpRewritePattern<StoreOpT> {
         rewriter, loc, source_val, iab_view, info.iab_index, base_view,
         info.offsets, info.sizes, info.strides);
     // Like a direct store, transfer at the rate of the producing compute.
-    copyAttrsAndThrottle(store, ind_store, getProducerThrottle(source_val));
+    copyAttrsAndAccessGranularity(store, ind_store,
+                                  getProducerAccessGranularity(source_val));
 
     rewriter.eraseOp(store);
 

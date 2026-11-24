@@ -53,7 +53,7 @@ const auto kSkipRegions = mlir::OpPrintingFlags().skipRegions();
 /// Discardable attributes that block the fold of a relay when both of its
 /// transfers carry them with different values.
 constexpr llvm::StringLiteral kNonMergeableAttrs[] = {
-    "dataflow_scheduler.throttle",
+    "dataflow_scheduler.access_granularity",
 };
 
 /// A transfer from memory into a FIFO slot, in the producer, and the transfer
