@@ -3,13 +3,13 @@
 
 // RUN: dataflow-scheduler-opt -fold-fifo-relay-stages %s | FileCheck %s
 
-// Different throttles on the two halves of a pair.
+// Different access granularities on the two halves of a pair.
 
-// CHECK-LABEL:   func.func @conflicting_throttle(
+// CHECK-LABEL:   func.func @conflicting_access_granularity(
 // CHECK-COUNT-2:   ktdf.data_transfer from {{.*}} !ktdf.fifo.slot
 // CHECK-NOT:       ktdf.data_transfer from {{.*}} : memref<{{.*}}>, memref<
 
-func.func @conflicting_throttle(%a: memref<1x64xf16, "DDR">, %b: memref<1x32xf16, "DDR">) {
+func.func @conflicting_access_granularity(%a: memref<1x64xf16, "DDR">, %b: memref<1x32xf16, "DDR">) {
   ktdf.pipeline {
     %p:5 = ktdf.private -> (!ktdf.fifo.slot<"DDR" -> "L1", 64xf16>, !ktdf.fifo.slot<"DDR" -> "L1", 32xf16>, !ktdf.token, memref<1x64xf16, "L1">, memref<1x32xf16, "L1">) {
       %slots:2 = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>, !ktdf.fifo.slot<"DDR" -> "L1", 32xf16>
@@ -19,12 +19,12 @@ func.func @conflicting_throttle(%a: memref<1x64xf16, "DDR">, %b: memref<1x32xf16
       ktdf.private_yield %slots#0, %slots#1, %t, %l1a, %l1b : !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>, !ktdf.fifo.slot<"DDR" -> "L1", 32xf16>, !ktdf.token, memref<1x64xf16, "L1">, memref<1x32xf16, "L1">
     }
     ktdf.stage depends_in(none) depends_out(%p#2) {
-      ktdf.data_transfer from %a[0, 0] size [1, 64] to %p#0 size [1, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<1x64xf16, "DDR">, !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>
-      ktdf.data_transfer from %b[0, 0] size [1, 32] to %p#1 size [1, 32] {dataflow_scheduler.throttle = 32 : i64} : memref<1x32xf16, "DDR">, !ktdf.fifo.slot<"DDR" -> "L1", 32xf16>
+      ktdf.data_transfer from %a[0, 0] size [1, 64] to %p#0 size [1, 64] {dataflow_scheduler.access_granularity = 64 : i64} : memref<1x64xf16, "DDR">, !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>
+      ktdf.data_transfer from %b[0, 0] size [1, 32] to %p#1 size [1, 32] {dataflow_scheduler.access_granularity = 32 : i64} : memref<1x32xf16, "DDR">, !ktdf.fifo.slot<"DDR" -> "L1", 32xf16>
     }
     ktdf.stage depends_in(%p#2) depends_out(none) {
-      ktdf.data_transfer from %p#0 size [1, 64] to %p#3[0, 0] size [1, 64] {dataflow_scheduler.throttle = 64 : i64} : !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>, memref<1x64xf16, "L1">
-      ktdf.data_transfer from %p#1 size [1, 32] to %p#4[0, 0] size [1, 32] {dataflow_scheduler.throttle = 16 : i64} : !ktdf.fifo.slot<"DDR" -> "L1", 32xf16>, memref<1x32xf16, "L1">
+      ktdf.data_transfer from %p#0 size [1, 64] to %p#3[0, 0] size [1, 64] {dataflow_scheduler.access_granularity = 64 : i64} : !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>, memref<1x64xf16, "L1">
+      ktdf.data_transfer from %p#1 size [1, 32] to %p#4[0, 0] size [1, 32] {dataflow_scheduler.access_granularity = 16 : i64} : !ktdf.fifo.slot<"DDR" -> "L1", 32xf16>, memref<1x32xf16, "L1">
     }
   }
   return
