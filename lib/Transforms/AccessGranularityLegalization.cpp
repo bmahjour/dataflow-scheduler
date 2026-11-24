@@ -33,8 +33,9 @@
 // This pass's responsibilities are:
 //   1. For load transfers (source is a memref): query the load unit's
 //      access_granularity for the source memory space, compute the smallest
-//      fitting legal transfer size, annotate `dataflow_scheduler.access_granularity`,
-//      and widen innermost dimensions and destination buffers/slots as needed.
+//      fitting legal transfer size, annotate
+//      `dataflow_scheduler.access_granularity`, and widen innermost dimensions
+//      and destination buffers/slots as needed.
 //   2. For store transfers (destination is a memref): query the store unit's
 //      access_granularity for the destination memory space, annotate
 //      `dataflow_scheduler.access_granularity`, and verify the store satisfies
