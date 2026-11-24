@@ -254,53 +254,8 @@ auto scheduler::getAccessGranularity(mlir::Operation* op) -> int64_t {
           kAccessGranularityAttrName)) {
     return attr.getValue();
   }
-  if (const auto attr =
-          op->getAttrOfType<mlir::ktdf_arch::I64Attr>(kVectorLanesAttrName)) {
-    return attr.getValue();
-  }
   return std::numeric_limits<int64_t>::max();
 };
-
-/// Whether @p op only moves data and passes on the access granularity around
-/// it.
-[[nodiscard]] static auto isGranularityTransparent(mlir::Operation* op)
-    -> bool {
-  return !op->hasAttr(kAccessGranularityAttrName) &&
-         !op->hasAttr(kVectorLanesAttrName) &&
-         (isReshape(op) ||
-          llvm::isa<mlir::tensor::ExtractSliceOp, mlir::tensor::InsertSliceOp>(
-              op));
-}
-
-auto scheduler::getAccessGranularity(mlir::OpResult result) -> int64_t {
-  auto min = std::numeric_limits<int64_t>::max();
-  for (auto* user : result.getUsers()) {
-    min = std::min(min, isGranularityTransparent(user)
-                            ? getAccessGranularity(user->getOpResult(0))
-                            : getAccessGranularity(user));
-  }
-  return min;
-};
-
-auto scheduler::getAccessGranularity(mlir::OpOperand& operand) -> int64_t {
-  auto result = llvm::dyn_cast<mlir::OpResult>(operand.get());
-  if (!result) {
-    return std::numeric_limits<int64_t>::max();
-  }
-
-  auto* const producer = result.getOwner();
-  if (!isGranularityTransparent(producer)) {
-    return getAccessGranularity(producer);
-  }
-
-  // An `insert_slice` combines its source and destination.
-  if (auto insert = llvm::dyn_cast<mlir::tensor::InsertSliceOp>(producer)) {
-    return std::min(getAccessGranularity(insert.getSourceMutable()),
-                    getAccessGranularity(insert.getDestMutable()));
-  }
-
-  return getAccessGranularity(producer->getOpOperand(0));
-}
 
 void scheduler::setAccessGranularity(mlir::Operation* op, int64_t value) {
   op->setAttr(kAccessGranularityAttrName,
@@ -496,8 +451,7 @@ struct TileLoad : mlir::OpRewritePattern<mlir::tensor::ExtractSliceOp> {
             .getElementType();
     auto new_load = mlir::ktdp_lowering::LoadOp::create(
         rewriter, load.getLoc(), load.getAccessTile(), slice, element_type);
-    setAccessGranularity(new_load,
-                         getAccessGranularity(extract->getOpResult(0)));
+    new_load->setDiscardableAttrs(load->getRawDictionaryAttrs());
 
     // Reshape the tile, and add the hops back in, counting the load as one.
     mlir::Value loaded =
@@ -633,8 +587,7 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     // Create the `ktdp_lowering.store` that captures the applied tiling.
     auto new_store = mlir::ktdp_lowering::StoreOp::create(
         rewriter, store.getLoc(), stored, store.getAccessTile(), slice);
-    setAccessGranularity(new_store,
-                         getAccessGranularity(insert_slice.getSourceMutable()));
+    new_store->setDiscardableAttrs(store->getRawDictionaryAttrs());
 
     // The loop nest no longer produces the data, and remaining users must now
     // load it again from memory.

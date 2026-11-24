@@ -22,8 +22,7 @@
 // CHECK-NEXT:              %[[EQ:.+]] = arith.cmpi eq, %[[I2]], %{{.+}} : index
 // CHECK-NEXT:              scf.if %[[EQ]] {
 // CHECK-NEXT:                %[[AB_CAST:.+]] = memref.memory_space_cast %[[AB]]
-// CHECK-NEXT:                ktdf.data_transfer from %[[AB_CAST]][%[[I1]], 0] size [1, 32] to %[[IAB]][0] size [32]
-// CHECK-SAME:                  {dataflow_scheduler.access_granularity = 1 : i64} : memref<2x32xindex, "DDR">, memref<32xindex, "IAB">
+// CHECK-NEXT:                ktdf.data_transfer from %[[AB_CAST]][%[[I1]], 0] size [1, 32] to %[[IAB]][0] size [32] : memref<2x32xindex, "DDR">, memref<32xindex, "IAB">
 // CHECK-NEXT:              }
 // CHECK:                   %[[BASE:.+]] = memref.reinterpret_cast %{{.+}} to offset: [%{{.+}}], sizes: [64, 2, 64], strides: [64, 4096, 1]
 // CHECK-NEXT:              %[[IAB_RC:.+]] = memref.reinterpret_cast %[[IAB]] to offset: [%{{.+}}], sizes: [32], strides: [1]
@@ -32,7 +31,7 @@
 // CHECK-NEXT:               dir_src = %[[BASE]][0, %[[I3]], 0] size [1, 1, 64]
 // CHECK-NEXT:               ind_dst = none
 // CHECK-NEXT:               dir_dst = %[[PRV]]#2 size [64]
-// CHECK-NEXT:               {dataflow_scheduler.access_granularity = 64 : i64} : memref<32xindex, strided<[1], offset: ?>, "IAB">, memref<64x2x64xf16, strided<[64, 4096, 1], offset: ?>, "DDR">, none, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>
+// CHECK-NEXT:               : memref<32xindex, strided<[1], offset: ?>, "IAB">, memref<64x2x64xf16, strided<[64, 4096, 1], offset: ?>, "DDR">, none, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>
 // CHECK-NEXT:            }
 
 // Stage 2 (compute).
@@ -45,7 +44,7 @@
 // Stage 3 (direct store).
 // CHECK-NEXT:            ktdf.stage depends_in(%[[PRV]]#1) depends_out(none) {
 // CHECK-NOT:               ktdf.ind_data_transfer
-// CHECK:                   ktdf.data_transfer from %[[PRV]]#0 size [1, 1, 1, 64] to %{{.+}}[%[[I1]], %[[I2]], 0, 0] size [1, 1, 1, 64] {dataflow_scheduler.access_granularity = 64 : i64}
+// CHECK:                   ktdf.data_transfer from %[[PRV]]#0 size [1, 1, 1, 64] to %{{.+}}[%[[I1]], %[[I2]], 0, 0] size [1, 1, 1, 64] :
 // CHECK-NEXT:            }
 // CHECK-NEXT:          }
 // CHECK-NOT:     ktdp_lowering.ind_load

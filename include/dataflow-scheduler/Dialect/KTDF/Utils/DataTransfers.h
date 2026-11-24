@@ -53,16 +53,6 @@ using AccessTile = mlir::TypedValue<mlir::ktdp::AccessTileType>;
 /// Gets the access granularity attribute value of @p op , or INT64_MAX if
 /// unset.
 [[nodiscard]] auto getAccessGranularity(mlir::Operation* op) -> int64_t;
-/// Gets the maximum access granularity with which @p result can be produced.
-///
-/// The maximum production access granularity is the minimum of all user access
-/// granularities.
-[[nodiscard]] auto getAccessGranularity(mlir::OpResult result) -> int64_t;
-/// Gets the maximum access granularity with which @p operand can be consumed.
-///
-/// The maximum consumption access granularity is the producer's access
-/// granularity, or INT64_MAX.
-[[nodiscard]] auto getAccessGranularity(mlir::OpOperand& operand) -> int64_t;
 
 /// Sets the access granularity attribute value of @p op .
 void setAccessGranularity(mlir::Operation* op, int64_t value);
